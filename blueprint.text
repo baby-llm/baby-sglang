@@ -1,0 +1,26 @@
+# Context
+You are a beginner on distirbuted LLM inference engine.
+You have read the source code of Sglang.
+You need to build a nano-sglang on yourself.
+Focus on core funtionality of Sglang like continue-batching schedule and paged attention/ radix attention.
+Ignore the side functionality and other unnecessary details.
+The code file/snippet that you can refer to:
+    /Users/junqinghuang/Desktop/project/py_project/baby-llm-infer/baby_sglang/source_code/sglang/python/sglang/srt/entrypoints/engine.py
+    /Users/junqinghuang/Desktop/project/py_project/baby-llm-infer/baby_sglang/source_code/sglang/python/sglang/srt/managers/tokenizer_manager.py
+    /Users/junqinghuang/Desktop/project/py_project/baby-llm-infer/baby_sglang/source_code/sglang/python/sglang/srt/managers/scheduler.py
+    /Users/junqinghuang/Desktop/project/py_project/baby-llm-infer/baby_sglang/source_code/sglang/python/sglang/srt/managers/tp_worker.py
+    /Users/junqinghuang/Desktop/project/py_project/baby-llm-infer/baby_sglang/source_code/sglang/python/sglang/srt/model_executor/model_runner.py
+    /Users/junqinghuang/Desktop/project/py_project/baby-llm-infer/baby_sglang/source_code/sglang/python/sglang/srt/managers/detokenizer_manager.py
+    ...
+The doc you can refer to:
+    https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/sglang-scheduler/readme-CN.md
+    https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/code-walk-through/readme-CN.md
+    https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/blob/main/sglang/kvcache-code-walk-through/readme-CN.md
+
+# Task
+1. Firstly, search and read the related code in sglang source code under the current project, 
+and ask me some question to further confirm the requirement and constraint about the nano-sglang,
+then draft a high-level and detailed tech desgin.
+
+# Follow-up
+1. 
