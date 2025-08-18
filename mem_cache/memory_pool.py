@@ -1,118 +1,185 @@
-import torch
-from typing import List
+"""
+Memory pool implementation for baby-sglang.
+
+Manages GPU memory allocation for KV cache and model execution.
+Implements paged attention memory management based on SGLang.
+"""
+
+import logging
+from typing import Dict, List, Optional, Tuple, Any
+import math
+
+logger = logging.getLogger(__name__)
+
 
 class MemoryPool:
     """
-    MemoryPool 负责管理 KV Cache 的物理内存。
+    GPU memory pool for efficient KV cache management.
     
-    这是 PagedAttention 机制的基础。它将预先分配的一大块 GPU 内存 (`gpu_mem_pool`)
-    分割成固定大小的块 (blocks)，并维护一个空闲块列表 (`free_blocks`)。
-    
-    它的主要职责是：
-    1.  初始化时，根据模型参数 (num_layers, num_heads, head_dim) 和批处理大小，
-        预先分配一块连续的 GPU 张量作为 KV Cache 池。
-    2.  将这块大张量视图化为一个个小的 "block"。
-    3.  提供 `alloc` 方法，从空闲列表中取出一个或多个块的索引。
-    4.  提供 `free` 方法，将使用完毕的块的索引归还到空闲列表中。
-    
-    这个类的设计参考了 `sglang.srt.mem_cache.memory_pool.MemoryPool`，
-    但简化了对不同数据类型 (dtype) 和分布式环境 (TP) 的处理。
+    Implements paged attention memory allocation where memory is
+    divided into fixed-size pages that can be allocated and freed
+    dynamically.
     """
-    def __init__(self, k_cache_size: int, v_cache_size: int,
-                 block_size: int, device: str, mem_fraction_static: float):
+    
+    def __init__(
+        self,
+        total_gpu_memory: int = 8 * 1024**3,  # 8GB default
+        page_size: int = 16,  # Tokens per page
+        reserved_memory: int = 2 * 1024**3,  # 2GB reserved for model
+    ):
         """
-        初始化内存池。
-
+        Initialize memory pool.
+        
         Args:
-            k_cache_size (int): 单个 K-cache 块的元素数量。
-            v_cache_size (int): 单个 V-cache 块的元素数量。
-            block_size (int): 每个内存块可以存储的 token 数量。
-            device (str): 内存分配的目标设备 (e.g., "cuda")。
-            mem_fraction_static (float): 用于 KV Cache 的静态 GPU 内存比例。
+            total_gpu_memory: Total GPU memory in bytes
+            page_size: Number of tokens per memory page
+            reserved_memory: Memory reserved for model weights
         """
-        self.k_cache_size = k_cache_size
-        self.v_cache_size = v_cache_size
-        self.block_size = block_size
-        self.device = device
-        self.mem_fraction_static = mem_fraction_static
-
-        # 计算总共需要多少个块 (num_blocks)
-        # 这通常基于可用的 GPU 内存和每个块的大小来决定
-        self.num_blocks = self._calculate_num_blocks()
+        self.total_memory = total_gpu_memory
+        self.page_size = page_size
+        self.reserved_memory = reserved_memory
+        self.available_memory = total_gpu_memory - reserved_memory
         
-        # 预分配 K 和 V 的物理内存池
-        # 形状为 (num_blocks, k_cache_size_per_block)
-        self.gpu_k_cache_pool = torch.empty(
-            (self.num_blocks, self.k_cache_size), dtype=torch.float16, device=self.device
-        )
-        self.gpu_v_cache_pool = torch.empty(
-            (self.num_blocks, self.v_cache_size), dtype=torch.float16, device=self.device
-        )
-
-        # 初始化空闲块列表，包含所有块的索引
-        self.free_blocks: List[int] = list(range(self.num_blocks))
-
-    def _calculate_num_blocks(self) -> int:
+        # Calculate number of pages based on KV cache size per token
+        # TODO: Calculate actual KV cache size based on model config
+        # Rough estimate: ~100 bytes per token for KV cache
+        kv_size_per_token = 100  # bytes
+        kv_size_per_page = page_size * kv_size_per_token
+        self.total_pages = self.available_memory // kv_size_per_page
+        
+        # Page allocation tracking
+        self.free_pages: List[int] = list(range(self.total_pages))
+        self.allocated_pages: Dict[str, List[int]] = {}  # request_id -> page_list
+        
+        # Memory statistics
+        self.peak_usage = 0
+        self.allocation_count = 0
+        
+        logger.info(f"MemoryPool initialized: {self.total_pages} pages of {page_size} tokens each")
+    
+    def allocate_pages(self, request_id: str, num_tokens: int) -> Optional[List[int]]:
         """
-        根据可用 GPU 内存和指定的比例计算可以分配的总块数。
-        """
-        if self.device != "cuda":
-            # 如果不是在 CUDA 设备上，我们返回一个固定的默认值，因为没有 GPU 内存可查。
-            return 2048
-
-        # torch.cuda.mem_get_info() 返回一个元组 (free_memory, total_memory)，单位是字节。
-        free_mem, total_mem = torch.cuda.mem_get_info()
+        Allocate memory pages for a request.
         
-        # 计算指定用于 KV Cache 的总内存量
-        total_mem_for_kv_cache = int(total_mem * self.mem_fraction_static)
-        
-        # 计算单个块（包含 K 和 V）所需的内存大小
-        # 假设使用 float16，每个元素占 2 个字节
-        bytes_per_element = 2
-        block_size_in_bytes = (self.k_cache_size + self.v_cache_size) * bytes_per_element
-        
-        # 计算可以容纳的总块数
-        num_blocks = total_mem_for_kv_cache // block_size_in_bytes
-        
-        print(f"Total GPU mem: {total_mem / 1e9:.2f} GB, "
-              f"Available mem for KV cache: {total_mem_for_kv_cache / 1e9:.2f} GB, "
-              f"Allocating {num_blocks} blocks.")
-              
-        return num_blocks
-
-    def alloc(self, num_blocks: int = 1) -> List[int]:
-        """
-        从空闲列表中分配指定数量的块。
-
         Args:
-            num_blocks (int): 需要分配的块的数量。
-
+            request_id: Unique identifier for the request
+            num_tokens: Number of tokens to allocate for
+            
         Returns:
-            List[int]: 一个包含分配的块索引的列表。如果空闲块不足，
-                       则返回一个空列表或抛出异常。
+            List of allocated page IDs, or None if allocation failed
         """
-        if self.get_freed_block_num() < num_blocks:
-            # 在真实系统中，这里应该抛出一个特定的 OutOfMemory 异常
-            raise RuntimeError("Out of memory in MemoryPool")
+        num_pages_needed = math.ceil(num_tokens / self.page_size)
         
-        allocated_blocks = self.free_blocks[:num_blocks]
-        self.free_blocks = self.free_blocks[num_blocks:]
-        return allocated_blocks
-
-    def free(self, block_indices: List[int]):
+        if len(self.free_pages) < num_pages_needed:
+            logger.warning(f"Cannot allocate {num_pages_needed} pages, only {len(self.free_pages)} available")
+            return None
+        
+        # Allocate pages
+        allocated = []
+        for _ in range(num_pages_needed):
+            page_id = self.free_pages.pop(0)
+            allocated.append(page_id)
+        
+        self.allocated_pages[request_id] = allocated
+        self.allocation_count += 1
+        
+        # Update peak usage
+        current_usage = self.total_pages - len(self.free_pages)
+        self.peak_usage = max(self.peak_usage, current_usage)
+        
+        logger.debug(f"Allocated {num_pages_needed} pages for request {request_id}")
+        return allocated
+    
+    def deallocate_pages(self, request_id: str):
         """
-        将一个或多个块归还到空闲列表。
-
+        Deallocate memory pages for a request.
+        
         Args:
-            block_indices (List[int]): 要释放的块的索引列表。
+            request_id: Request to deallocate pages for
         """
-        # 在真实实现中，可能需要检查重复释放等问题
-        self.free_blocks.extend(block_indices)
-
-    def get_freed_block_num(self) -> int:
-        """返回当前空闲块的数量。"""
-        return len(self.free_blocks)
-
-    def get_total_block_num(self) -> int:
-        """返回总块数。"""
-        return self.num_blocks
+        if request_id not in self.allocated_pages:
+            logger.warning(f"No pages allocated for request {request_id}")
+            return
+        
+        pages = self.allocated_pages.pop(request_id)
+        self.free_pages.extend(pages)
+        self.free_pages.sort()  # Keep free pages sorted for allocation efficiency
+        
+        logger.debug(f"Deallocated {len(pages)} pages for request {request_id}")
+    
+    def get_page_addresses(self, request_id: str) -> Optional[List[int]]:
+        """
+        Get physical page addresses for a request.
+        
+        Args:
+            request_id: Request ID
+            
+        Returns:
+            List of page addresses, or None if not found
+        """
+        if request_id not in self.allocated_pages:
+            return None
+        
+        # TODO: Convert page IDs to actual GPU memory addresses
+        # TODO: Handle memory mapping and address translation
+        page_ids = self.allocated_pages[request_id]
+        
+        # Placeholder: return page IDs as addresses
+        return page_ids
+    
+    def can_allocate(self, num_tokens: int) -> bool:
+        """
+        Check if allocation is possible for given number of tokens.
+        
+        Args:
+            num_tokens: Number of tokens to check
+            
+        Returns:
+            True if allocation would succeed
+        """
+        num_pages_needed = math.ceil(num_tokens / self.page_size)
+        return len(self.free_pages) >= num_pages_needed
+    
+    def get_memory_usage(self) -> Dict[str, Any]:
+        """
+        Get current memory usage statistics.
+        
+        Returns:
+            Dictionary with memory metrics
+        """
+        allocated_pages = self.total_pages - len(self.free_pages)
+        utilization = (allocated_pages / self.total_pages) * 100.0
+        
+        return {
+            "total_pages": self.total_pages,
+            "allocated_pages": allocated_pages,
+            "free_pages": len(self.free_pages),
+            "utilization_percent": utilization,
+            "peak_usage": self.peak_usage,
+            "allocation_count": self.allocation_count,
+            "page_size": self.page_size,
+            "total_memory_gb": self.total_memory / (1024**3),
+            "available_memory_gb": self.available_memory / (1024**3)
+        }
+    
+    def compact_memory(self):
+        """
+        Compact memory by reorganizing allocated pages.
+        
+        TODO: Implement memory compaction to reduce fragmentation
+        TODO: Move pages to create larger contiguous free regions
+        """
+        logger.debug("Memory compaction not implemented yet")
+    
+    def reset(self):
+        """
+        Reset the memory pool to initial state.
+        
+        Deallocates all pages and resets statistics.
+        """
+        self.free_pages = list(range(self.total_pages))
+        self.allocated_pages.clear()
+        self.peak_usage = 0
+        self.allocation_count = 0
+        
+        logger.info("Memory pool reset to initial state")

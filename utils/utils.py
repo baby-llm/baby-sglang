@@ -1,120 +1,221 @@
+"""
+Utility functions for baby-sglang.
+
+Common helper functions and utilities used across the system.
+"""
+
+import logging
 import os
-import zmq
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
-from transformers import AutoConfig
+import sys
+from typing import Any, Dict, Optional
 
-# ============================================
-#               Data Structures
-# ============================================
 
-@dataclass
-class Req:
+def setup_logger(
+    name: str,
+    level: int = logging.INFO,
+    format_str: Optional[str] = None
+) -> logging.Logger:
     """
-    Req (Request) 对象是在 `nano-sglang` 系统内部流转的核心数据结构。
-    它封装了一个推理请求的所有状态信息。
-    """
-    request_id: str
-    input_ids: List[int]
-    sampling_params: Dict[str, Any]
-    
-    # 动态变化的字段
-    output_ids: List[int] = field(default_factory=list)
-    
-    # PagedAttention 相关字段
-    # `token_to_kv_pool` 是一个从 token 在序列中的逻辑位置到其在
-    # `MemoryPool` 中物理块索引的映射。
-    # 这是一个实现 PagedAttention 的关键数据结构。
-    token_to_kv_pool: Dict[int, int] = field(default_factory=dict)
-    
-    def __len__(self):
-        """返回请求的总长度（输入 + 输出）。"""
-        return len(self.input_ids) + len(self.output_ids)
-
-@dataclass
-class Finish:
-    """
-    一个简单的信号对象，由 Scheduler 发送给 Detokenizer，
-    表示一个请求已经全部处理完成。
-    """
-    request_id: str
-    req_output: List[int] # 完整的输出 token 序列
-
-@dataclass
-class ModelConfig:
-    """
-    存储从 HuggingFace Hub 或本地路径加载的模型配置信息。
-    """
-    def __init__(self, path: str, trust_remote_code: bool):
-        self.path = path
-        self.trust_remote_code = trust_remote_code
-        
-        # 使用 transformers.AutoConfig 加载模型的 config.json
-        config = AutoConfig.from_pretrained(
-            path, trust_remote_code=trust_remote_code
-        )
-        
-        # 从加载的 config 中提取核心参数
-        self.vocab_size = config.vocab_size
-        self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.num_attention_heads
-        self.num_hidden_layers = config.num_hidden_layers
-        
-        # 计算 head_dim，这对于 KV Cache 的大小计算至关重要
-        self.head_dim = self.hidden_size // self.num_attention_heads
-        
-        # 模型类型，用于可能的特殊处理
-        self.model_type = config.model_type
-
-# ============================================
-#           Inter-Process Communication
-# ============================================
-
-def get_server_name(server_type: str) -> str:
-    """根据服务类型生成 ZMQ 的 IPC (Inter-Process Communication) 地址。"""
-    # IPC 使用文件系统路径作为地址
-    return f"ipc:///tmp/nano_sglang_{server_type}.sock"
-
-def get_all_server_names() -> List[str]:
-    """返回所有服务类型的标准名称。"""
-    return [get_server_name(st) for st in ["scheduler", "detokenizer"]]
-
-def get_and_register_new_filename(server_name: str):
-    """清理可能存在的旧 ZMQ socket 文件。"""
-    filename = server_name.replace("ipc://", "")
-    if os.path.exists(filename):
-        os.remove(filename)
-
-def get_server_socket(context: zmq.Context, server_name: str, 
-                      socket_type: int, bind: bool) -> zmq.Socket:
-    """
-    创建一个 ZMQ socket 并根据 `bind` 参数决定是绑定地址还是连接地址。
+    Setup logger with consistent formatting.
     
     Args:
-        context: ZMQ 上下文。
-        server_name: 服务的 IPC 地址。
-        socket_type: ZMQ socket 类型 (e.g., zmq.PULL, zmq.PUSH)。
-        bind: 如果为 `True`，则 socket 绑定到地址 (服务器端)；
-              如果为 `False`，则 socket 连接到地址 (客户端)。
+        name: Logger name
+        level: Logging level
+        format_str: Custom format string
+        
+    Returns:
+        Configured logger instance
     """
-    socket = context.socket(socket_type)
-    if bind:
-        socket.bind(server_name)
-    else:
-        socket.connect(server_name)
-    return socket
-
-def send_req_to_scheduler(scheduler_server_name: str,
-                          req: Req):
-    """
-    一个辅助函数，用于从外部 (如 SGLangEngine) 向 Scheduler 发送请求。
-    这是一个一次性的 ZMQ 连接，发送后即关闭。
-    """
-    context = zmq.Context()
-    sender = get_server_socket(context, scheduler_server_name, zmq.PUSH, bind=False)
+    if format_str is None:
+        format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     
-    sender.send_pyobj(req)
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    
+    # Avoid duplicate handlers
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(level)
+        
+        formatter = logging.Formatter(format_str)
+        handler.setFormatter(formatter)
+        
+        logger.addHandler(handler)
+    
+    return logger
 
-    # 短暂等待以确保消息发送出去
-    sender.close()
-    context.term()
+
+def get_gpu_memory_info() -> Dict[str, float]:
+    """
+    Get GPU memory information.
+    
+    Returns:
+        Dictionary with GPU memory stats in GB
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device = torch.cuda.current_device()
+            total = torch.cuda.get_device_properties(device).total_memory
+            allocated = torch.cuda.memory_allocated(device)
+            reserved = torch.cuda.memory_reserved(device)
+            
+            return {
+                "total_gb": total / (1024**3),
+                "allocated_gb": allocated / (1024**3),
+                "reserved_gb": reserved / (1024**3),
+                "free_gb": (total - reserved) / (1024**3)
+            }
+        else:
+            return {"total_gb": 0.0, "allocated_gb": 0.0, "reserved_gb": 0.0, "free_gb": 0.0}
+    except ImportError:
+        return {"total_gb": 0.0, "allocated_gb": 0.0, "reserved_gb": 0.0, "free_gb": 0.0}
+
+
+def validate_model_path(model_path: str) -> bool:
+    """
+    Validate that model path exists and contains required files.
+    
+    Args:
+        model_path: Path to model directory or file
+        
+    Returns:
+        True if valid model path
+    """
+    if not os.path.exists(model_path):
+        return False
+    
+    # TODO: Add more specific validation
+    # - Check for config.json
+    # - Check for model weights (pytorch_model.bin, model.safetensors, etc.)
+    # - Check for tokenizer files
+    
+    return True
+
+
+def format_bytes(bytes_value: int) -> str:
+    """
+    Format bytes value to human readable string.
+    
+    Args:
+        bytes_value: Number of bytes
+        
+    Returns:
+        Formatted string (e.g., "1.5 GB")
+    """
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(bytes_value)
+    
+    for unit in units:
+        if value < 1024.0:
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    
+    return f"{value:.1f} {units[-1]}"
+
+
+def create_unique_id(prefix: str = "req") -> str:
+    """
+    Create a unique identifier.
+    
+    Args:
+        prefix: Prefix for the ID
+        
+    Returns:
+        Unique identifier string
+    """
+    import time
+    import uuid
+    
+    timestamp = int(time.time() * 1000)  # milliseconds
+    unique_suffix = str(uuid.uuid4())[:8]
+    
+    return f"{prefix}_{timestamp}_{unique_suffix}"
+
+
+def safe_import(module_name: str, package: Optional[str] = None) -> Optional[Any]:
+    """
+    Safely import a module, returning None if import fails.
+    
+    Args:
+        module_name: Name of module to import
+        package: Package name for relative imports
+        
+    Returns:
+        Imported module or None if import failed
+    """
+    try:
+        if package:
+            return __import__(module_name, fromlist=[package])
+        else:
+            return __import__(module_name)
+    except ImportError:
+        return None
+
+
+def get_environment_info() -> Dict[str, Any]:
+    """
+    Get information about the runtime environment.
+    
+    Returns:
+        Dictionary with environment information
+    """
+    info = {
+        "python_version": sys.version,
+        "platform": sys.platform,
+        "cpu_count": os.cpu_count(),
+    }
+    
+    # Add GPU info if available
+    torch = safe_import("torch")
+    if torch and torch.cuda.is_available():
+        info.update({
+            "cuda_available": True,
+            "cuda_device_count": torch.cuda.device_count(),
+            "cuda_version": torch.version.cuda,
+        })
+    else:
+        info["cuda_available"] = False
+    
+    return info
+
+
+class Timer:
+    """Simple timer utility for performance measurement."""
+    
+    def __init__(self):
+        self.start_time = None
+        self.end_time = None
+    
+    def start(self):
+        """Start timing."""
+        import time
+        self.start_time = time.time()
+    
+    def stop(self) -> float:
+        """
+        Stop timing and return elapsed time.
+        
+        Returns:
+            Elapsed time in seconds
+        """
+        import time
+        self.end_time = time.time()
+        
+        if self.start_time is None:
+            return 0.0
+        
+        return self.end_time - self.start_time
+    
+    def elapsed(self) -> float:
+        """
+        Get elapsed time without stopping.
+        
+        Returns:
+            Elapsed time in seconds
+        """
+        import time
+        if self.start_time is None:
+            return 0.0
+        
+        return time.time() - self.start_time
