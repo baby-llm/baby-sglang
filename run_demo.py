@@ -1,3 +1,7 @@
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 """
 Demo script for baby-sglang.
 
@@ -5,7 +9,7 @@ Simple example showing how to use the baby-sglang engine
 for text generation.
 """
 
-import logging
+import os
 import torch
 import time
 from engine import Engine
@@ -17,9 +21,6 @@ try:
 except ImportError:
     VLLM_AVAILABLE = False
     logging.warning("vLLM not available. Install with: pip install vllm")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 def benchmark_vllm(model_name: str, prompts: list, sampling_params: SamplingParams):
     """Benchmark inference with vLLM for comparison."""
@@ -58,7 +59,8 @@ def main():
         device = "cpu"
         logger.info("Using CPU device (this will be slow)")
 
-    model_name = "Qwen/Qwen3-0.6B"
+    # Prefer a tiny model for smoke tests; override via env BABY_SGL_MODEL
+    model_name = os.environ.get("BABY_SGL_MODEL", "Qwen/Qwen3-1.7B")
     logger.info(f"Loading model: {model_name}")
 
     model_config = ModelConfig(

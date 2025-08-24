@@ -6,7 +6,7 @@ Simplified version of SGLang's ModelRunner focusing on core functionality.
 """
 
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Any
 
 import torch
 from managers.io_struct import ModelConfig
@@ -52,10 +52,10 @@ class ModelRunner:
     def forward(
         self,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
-        kv_cache: List[Optional[Tuple[torch.Tensor, torch.Tensor]]],
+        position_ids: Optional[torch.Tensor] = None,
+        kv_cache: Optional[Any] = None,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Any]:
         """
         Performs a forward pass with a simplified KV cache.
         """
@@ -63,7 +63,6 @@ class ModelRunner:
              # Decode phase - use existing cache
             model_outputs = self.model(
                 input_ids=input_ids,
-                position_ids=position_ids,
                 attention_mask=attention_mask,
                 past_key_values=kv_cache,
                 use_cache=True,
