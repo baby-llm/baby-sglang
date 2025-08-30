@@ -233,9 +233,13 @@ class StaticBatchScheduler:
             self._cleanup_failed_requests(batch_requests)
             return None
     
-    def schedule_decode_batch(self) -> Optional[SimplifiedForwardBatch]:
+    def schedule_decode_batch(self, new_tokens: Optional[List[int]] = None) -> Optional[SimplifiedForwardBatch]:
         """
         Schedule decode batch for all running requests.
+        
+        Args:
+            new_tokens: List of newly sampled tokens for each decode-ready request.
+                       If None, will use placeholder logic (for compatibility).
         
         SGLang pattern: each request generates one token, extend allocations if needed.
         """
@@ -262,7 +266,7 @@ class StaticBatchScheduler:
                 self.req_to_token_pool.req_to_token[req.req_pool_idx, current_pos] = new_token_loc[0]
             
             # Step 2: Build decode batch
-            forward_batch = self._build_decode_batch(decode_ready, extended_tokens)
+            forward_batch = self._build_decode_batch(decode_ready, extended_tokens, new_tokens)
             
             return forward_batch
             
@@ -303,28 +307,32 @@ class StaticBatchScheduler:
     def _build_decode_batch(
         self,
         requests: List[SimplifiedRequest],
-        extended_tokens: List[int]
+        extended_tokens: List[int],
+        new_tokens: Optional[List[int]] = None
     ) -> SimplifiedForwardBatch:
         """Build SimplifiedForwardBatch for decode (SGLang pattern)."""
         
         # In decode mode: each request contributes exactly one NEW token
-        # The input_ids for decode should be the newly generated tokens from previous step
-        # This is a simplified implementation - in real usage, these would come from sampling
+        # The input_ids for decode should be the newly sampled tokens from previous step
         
         input_ids = []
         req_pool_indices = []
         seq_lens = []
         
-        for req in requests:
-            # For decode, we need the newly generated token as input
-            # In the actual generation loop, this would be the token just sampled
-            # For now, use the last generated token (placeholder logic)
-            if req.output_ids:
-                # Use the last generated token as input for next decode step
+        for i, req in enumerate(requests):
+            # Use the provided new token, or fallback to placeholder logic
+            if new_tokens is not None and i < len(new_tokens):
+                # Use the newly sampled token as input for next decode step
+                new_input_token = new_tokens[i]
+            elif req.output_ids:
+                # Fallback: use the last generated token (placeholder logic)
+                # NOTE: This is not ideal and should be replaced with proper sampling
                 new_input_token = req.output_ids[-1] 
             else:
-                # This shouldn't happen in normal decode phase, but fallback to last input token
+                # Emergency fallback: use last input token
+                # This shouldn't happen in normal decode phase
                 new_input_token = req.input_ids[-1]
+                logger.warning(f"Using emergency fallback token for request {req.request_id}")
                 
             input_ids.append(new_input_token)
             req_pool_indices.append(req.req_pool_idx)

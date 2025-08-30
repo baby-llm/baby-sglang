@@ -99,8 +99,8 @@ class SimplifiedForwardBatch:
         """
         batch_size = len(req_pool_indices)
         
-        # For decode, positions are the current sequence length (0-indexed position for new token)
-        positions = seq_lens.clone()  # seq_lens now represents current length, so new token is at seq_lens position
+        # For decode, positions are the current sequence length minus 1 (0-indexed position for new token)
+        positions = seq_lens - 1  # seq_lens represents total length, so new token is at seq_lens-1 position
         
         return cls(
             batch_size=batch_size,
@@ -165,14 +165,14 @@ class RotaryEmbedding(nn.Module):
     
     def forward(self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor):
         """Apply RoPE to q and k tensors (SGLang-compatible signature)."""
-        # positions: [seq_len], q/k: [seq_len, num_heads, head_dim]
-        freqs = torch.outer(positions.float(), self.inv_freq)  # [seq_len, head_dim//2]
-        cos = torch.cos(freqs).unsqueeze(1)  # [seq_len, 1, head_dim//2]
+        # positions: [total_tokens], q/k: [total_tokens, num_heads, head_dim]
+        freqs = torch.outer(positions.float(), self.inv_freq)  # [total_tokens, head_dim//2]
+        cos = torch.cos(freqs).unsqueeze(1)  # [total_tokens, 1, head_dim//2]
         sin = torch.sin(freqs).unsqueeze(1)
         
         # Expand cos/sin to match q/k num_heads dimension
         num_heads = q.shape[1]
-        cos = cos.expand(-1, num_heads, -1)  # [seq_len, num_heads, head_dim//2]
+        cos = cos.expand(-1, num_heads, -1)  # [total_tokens, num_heads, head_dim//2]
         sin = sin.expand(-1, num_heads, -1)
         
         # Apply rotation
@@ -183,7 +183,9 @@ class RotaryEmbedding(nn.Module):
     
     def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         """Apply rotary position embedding."""
-        x1, x2 = x.chunk(2, dim=-1)
+        # x: [total_tokens, num_heads, head_dim]
+        # cos/sin: [total_tokens, num_heads, head_dim//2]
+        x1, x2 = x.chunk(2, dim=-1)  # Each: [total_tokens, num_heads, head_dim//2]
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
@@ -237,8 +239,17 @@ class SimpleAttentionBackend:
             
             # Extract Q, K, V for this specific request only
             per_req_q = q[q_offset:q_offset + seq_len]      # [seq_len, num_heads, head_dim]
-            per_req_k = k[kv_offset:kv_offset + seq_len]    
-            per_req_v = v[kv_offset:kv_offset + seq_len]
+            per_req_k = k[kv_offset:kv_offset + seq_len]    # [seq_len, num_kv_heads, head_dim]
+            per_req_v = v[kv_offset:kv_offset + seq_len]    # [seq_len, num_kv_heads, head_dim]
+            
+            # Handle GQA: repeat K,V heads to match Q heads if needed
+            num_heads = per_req_q.shape[1]
+            num_kv_heads = per_req_k.shape[1]
+            if num_kv_heads < num_heads:
+                # Repeat K,V heads to match Q heads (GQA)
+                repeat_factor = num_heads // num_kv_heads
+                per_req_k = per_req_k.repeat_interleave(repeat_factor, dim=1)  # [seq_len, num_heads, head_dim]
+                per_req_v = per_req_v.repeat_interleave(repeat_factor, dim=1)  # [seq_len, num_heads, head_dim]
             
             # Reshape for PyTorch SDPA: [batch=1, num_heads, seq_len, head_dim]  
             q_sdpa = per_req_q.transpose(0, 1).unsqueeze(0)
@@ -306,8 +317,17 @@ class SimpleAttentionBackend:
             
             # Gather full context K,V for this request from cache (SGLang's core operation)
             k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
-            per_req_k = k_buffer[token_indices]  # [seq_len, num_heads, head_dim]
-            per_req_v = v_buffer[token_indices]
+            per_req_k = k_buffer[token_indices]  # [seq_len, num_kv_heads, head_dim]
+            per_req_v = v_buffer[token_indices]  # [seq_len, num_kv_heads, head_dim]
+            
+            # Handle GQA: repeat K,V heads to match Q heads if needed
+            num_heads = per_req_q.shape[1]
+            num_kv_heads = per_req_k.shape[1]
+            if num_kv_heads < num_heads:
+                # Repeat K,V heads to match Q heads (GQA)
+                repeat_factor = num_heads // num_kv_heads
+                per_req_k = per_req_k.repeat_interleave(repeat_factor, dim=1)  # [seq_len, num_heads, head_dim]
+                per_req_v = per_req_v.repeat_interleave(repeat_factor, dim=1)  # [seq_len, num_heads, head_dim]
             
             # Reshape for PyTorch SDPA: [batch=1, num_heads, seq_len, head_dim]
             q_sdpa = per_req_q.transpose(0, 1).unsqueeze(0)     # [1, num_heads, 1, head_dim]
