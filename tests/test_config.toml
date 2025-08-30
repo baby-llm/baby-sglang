@@ -1,0 +1,118 @@
+# Baby-SGLang Test Configuration
+# ================================
+
+[test]
+# Test discovery patterns
+test_patterns = ["test_*.py", "*_test.py"]
+test_dirs = ["tests/"]
+
+# Test execution settings
+verbosity = 1
+failfast = false
+buffer = true
+catch_break = true
+
+# Coverage settings
+coverage_source = ["."]
+coverage_omit = ["tests/*", "*/test_*", "setup.py", "*/__pycache__/*"]
+coverage_fail_under = 80
+
+[test.unit]
+# Unit test specific settings
+timeout_per_test = 30  # seconds
+parallel = false
+
+[test.integration]
+# Integration test settings
+timeout_per_test = 120  # seconds
+memory_limit = "2GB"
+require_cleanup = true
+
+[test.performance]
+# Performance test settings  
+timeout_per_test = 300  # seconds
+memory_limit = "4GB"
+benchmark_iterations = 3
+benchmark_warmup = 1
+
+[test.security]
+# Security test settings
+cross_request_isolation = true
+memory_boundary_checks = true
+attention_leakage_detection = true
+
+[devices]
+# Supported test devices
+cpu = true
+cuda = true
+mps = true  # Apple Metal Performance Shaders
+
+[dependencies]
+# Core dependencies for testing
+core = [
+    "torch>=2.0.0",
+    "tokenizers>=0.13.0",
+    "transformers>=4.30.0", 
+    "safetensors>=0.3.0"
+]
+
+# Testing dependencies
+testing = [
+    "psutil>=5.9.0",
+    "coverage>=7.0.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-timeout>=2.1.0",
+    "pytest-xdist>=3.0.0"  # For parallel testing
+]
+
+# Development dependencies
+development = [
+    "black>=23.0.0",
+    "isort>=5.12.0", 
+    "flake8>=6.0.0",
+    "mypy>=1.0.0"
+]
+
+[benchmark]
+# Benchmark configuration
+model_sizes = ["tiny", "small", "medium"]
+batch_sizes = [1, 2, 4, 8]
+sequence_lengths = [8, 16, 32, 64, 128]
+max_new_tokens = [1, 4, 8, 16]
+
+# Performance thresholds (tokens per second)
+min_throughput_cpu = 10.0
+min_throughput_cuda = 100.0
+min_throughput_mps = 50.0
+
+# Memory usage limits (MB per request)
+max_memory_per_request_cpu = 100.0
+max_memory_per_request_cuda = 200.0
+max_memory_per_request_mps = 150.0
+
+[ci]
+# CI/CD specific settings
+python_versions = ["3.8", "3.9", "3.10", "3.11"]
+os_matrix = ["ubuntu-latest", "macos-latest"]
+cuda_version = "11.8"
+
+# Test matrix for different configurations
+test_matrix = [
+    {os = "ubuntu-latest", python = "3.10", device = "cpu", tests = "all"},
+    {os = "ubuntu-latest", python = "3.10", device = "cuda", tests = "unit,integration"},
+    {os = "macos-latest", python = "3.10", device = "mps", tests = "unit,integration"},
+    {os = "macos-latest", python = "3.10", device = "cpu", tests = "all"}
+]
+
+[logging]
+# Test logging configuration
+level = "INFO"
+format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+capture_output = true
+
+[cleanup]
+# Post-test cleanup settings
+clear_cache = true
+reset_cuda_context = true
+garbage_collect = true
