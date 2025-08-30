@@ -639,163 +639,119 @@ class BabyQwen2ForCausalLM(nn.Module):
     
     def load_weights_from_hf(self, hf_model_path: str, device: str = "auto"):
         """
-        Load weights from HuggingFace checkpoint.
+        Load weights from HuggingFace checkpoint using transformers library.
         
-        Supports all Qwen2 model sizes and automatically maps weight names
-        from HuggingFace format to our simplified structure.
+        Simplified approach following SGLang patterns - let transformers handle the heavy lifting.
         
         Args:
-            hf_model_path: Path to HF model directory or model name
+            hf_model_path: Path to HF model directory
             device: Device to load weights on ("auto", "cpu", "cuda", "mps")
         """
         try:
+            from transformers import AutoModelForCausalLM
             import torch
-            import os
-            import json
-            from safetensors import safe_open
             
             logger.info(f"Loading Qwen2 weights from: {hf_model_path}")
             
-            # Step 1: Load model configuration
-            if os.path.isdir(hf_model_path):
-                config_path = os.path.join(hf_model_path, "config.json")
-                with open(config_path, 'r') as f:
-                    hf_config = json.load(f)
-            else:
-                raise ValueError(f"Local model path required: {hf_model_path}")
+            # Load HuggingFace model to get the state_dict
+            logger.info("Loading HuggingFace model...")
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                hf_model_path,
+                torch_dtype=torch.float16,  # Use FP16 for efficiency
+                device_map="cpu",  # Load to CPU first
+                trust_remote_code=True
+            )
             
-            logger.info(f"HF Config: {hf_config.get('hidden_size', 'unknown')} hidden_size, "
-                       f"{hf_config.get('num_hidden_layers', 'unknown')} layers")
+            # Get the state dict from HuggingFace model
+            hf_state_dict = hf_model.state_dict()
+            logger.info(f"Loaded {len(hf_state_dict)} weight tensors from HuggingFace model")
             
-            # Step 2: Verify config compatibility
-            self._verify_config_compatibility(hf_config)
+            # Load weights using SGLang-style iterator
+            weights_iterator = ((name, tensor) for name, tensor in hf_state_dict.items())
+            self.load_weights(weights_iterator)
             
-            # Step 3: Load weights from safetensors or pytorch files
-            weight_files = self._find_weight_files(hf_model_path)
-            state_dict = {}
-            
-            for weight_file in weight_files:
-                if weight_file.endswith('.safetensors'):
-                    with safe_open(weight_file, framework="pt", device="cpu") as f:
-                        for key in f.keys():
-                            state_dict[key] = f.get_tensor(key)
-                elif weight_file.endswith('.bin'):
-                    checkpoint = torch.load(weight_file, map_location="cpu")
-                    state_dict.update(checkpoint)
-                else:
-                    logger.warning(f"Unsupported weight file format: {weight_file}")
-            
-            logger.info(f"Loaded {len(state_dict)} weight tensors")
-            
-            # Step 4: Map HuggingFace weight names to our model structure
-            mapped_state_dict = self._map_hf_weights(state_dict)
-            
-            # Step 5: Load mapped weights into our model
-            missing_keys, unexpected_keys = self.load_state_dict(mapped_state_dict, strict=False)
-            
-            if missing_keys:
-                logger.warning(f"Missing keys in checkpoint: {missing_keys[:5]}...")
-            if unexpected_keys:
-                logger.warning(f"Unexpected keys in checkpoint: {unexpected_keys[:5]}...")
+            # Clean up HF model to save memory
+            del hf_model
+            torch.cuda.empty_cache()
             
             logger.info(f"Successfully loaded Qwen2 weights from {hf_model_path}")
             
-        except ImportError as e:
-            logger.error(f"Required library missing: {e}")
-            logger.error("Install with: pip install safetensors")
-            raise
         except Exception as e:
             logger.error(f"Failed to load HF weights: {e}")
             raise
     
-    def _verify_config_compatibility(self, hf_config: dict):
-        """Verify HuggingFace config is compatible with our model."""
-        our_config = self.config
+    def load_weights(self, weights):
+        """
+        Load weights using SGLang's approach with proper weight mapping.
         
-        # Critical parameters that must match
-        critical_params = [
-            'hidden_size', 'num_attention_heads', 'num_hidden_layers', 
-            'intermediate_size', 'vocab_size'
+        This method follows SGLang's load_weights pattern from qwen2.py.
+        """
+        # SGLang-style stacked parameter mappings for merged weights
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)  
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"), 
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
         
-        for param in critical_params:
-            if hasattr(our_config, param):
-                our_val = getattr(our_config, param)
-                hf_val = hf_config.get(param)
-                if our_val != hf_val:
-                    raise ValueError(
-                        f"Config mismatch for {param}: ours={our_val}, HF={hf_val}"
-                    )
-    
-    def _find_weight_files(self, model_path: str) -> List[str]:
-        """Find weight files in model directory."""
-        import glob
-        import os
-        
-        weight_files = []
-        
-        # Look for safetensors files first (preferred)
-        safetensor_files = glob.glob(os.path.join(model_path, "*.safetensors"))
-        if safetensor_files:
-            weight_files.extend(sorted(safetensor_files))
-            logger.info(f"Found {len(safetensor_files)} safetensors files")
-        else:
-            # Fallback to pytorch files
-            pytorch_files = glob.glob(os.path.join(model_path, "pytorch_model*.bin"))
-            if pytorch_files:
-                weight_files.extend(sorted(pytorch_files))
-                logger.info(f"Found {len(pytorch_files)} pytorch files")
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            # Skip rotary embeddings and other unused weights
+            if "rotary_emb.inv_freq" in name or "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                continue
+                
+            # Handle stacked parameter mapping (like SGLang)  
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                
+                # Load the shard
+                self._load_weight_shard(param, loaded_weight, shard_id)
+                break
             else:
-                raise FileNotFoundError(f"No weight files found in {model_path}")
-        
-        return weight_files
+                # Direct weight loading
+                if name not in params_dict:
+                    continue  # Skip unknown weights
+                param = params_dict[name]
+                self._load_weight_direct(param, loaded_weight)
     
-    def _map_hf_weights(self, hf_state_dict: dict) -> dict:
-        """
-        Map HuggingFace Qwen2 weight names to our model structure.
-        
-        HF Qwen2 uses different naming conventions:
-        - model.embed_tokens.weight -> embed_tokens.weight
-        - model.layers.N.* -> layers.N.*
-        - model.norm.weight -> norm.weight
-        - lm_head.weight -> lm_head.weight
-        """
-        mapped_dict = {}
-        
-        for hf_key, tensor in hf_state_dict.items():
-            # Map HuggingFace names to our simplified names
-            our_key = self._convert_hf_key_to_ours(hf_key)
-            
-            if our_key:
-                mapped_dict[our_key] = tensor
-            else:
-        
-        logger.info(f"Mapped {len(mapped_dict)}/{len(hf_state_dict)} weight tensors")
-        return mapped_dict
-    
-    def _convert_hf_key_to_ours(self, hf_key: str) -> Optional[str]:
-        """Convert single HuggingFace key to our model's key."""
-        
-        # Remove 'model.' prefix if present
-        if hf_key.startswith('model.'):
-            key = hf_key[6:]  # Remove 'model.'
+    def _load_weight_shard(self, param: torch.Tensor, loaded_weight: torch.Tensor, shard_id):
+        """Load weight into a specific shard (for merged parameters like qkv_proj)."""
+        if shard_id == "q":
+            # Q shard - first portion
+            q_size = self.model.layers[0].self_attn.qkv_proj.q_size
+            param.data[:q_size].copy_(loaded_weight)
+        elif shard_id == "k":  
+            # K shard - middle portion
+            q_size = self.model.layers[0].self_attn.qkv_proj.q_size
+            kv_size = self.model.layers[0].self_attn.qkv_proj.kv_size
+            param.data[q_size:q_size + kv_size].copy_(loaded_weight)
+        elif shard_id == "v":
+            # V shard - last portion  
+            q_size = self.model.layers[0].self_attn.qkv_proj.q_size
+            kv_size = self.model.layers[0].self_attn.qkv_proj.kv_size
+            param.data[q_size + kv_size:].copy_(loaded_weight)
+        elif shard_id == 0:
+            # Gate shard (first half)
+            intermediate_size = loaded_weight.size(0)
+            param.data[:intermediate_size].copy_(loaded_weight)
+        elif shard_id == 1:
+            # Up shard (second half)
+            intermediate_size = loaded_weight.size(0) 
+            param.data[intermediate_size:].copy_(loaded_weight)
         else:
-            key = hf_key
-        
-        # Direct mappings for some keys
-        direct_mappings = {
-            'embed_tokens.weight': 'model.embed_tokens.weight',
-            'norm.weight': 'model.norm.weight',
-            'lm_head.weight': 'lm_head.weight',
-        }
-        
-        if key in direct_mappings:
-            return direct_mappings[key]
-        
-        # Layer-specific mappings
-        if key.startswith('layers.'):
-            # layers.N.something -> model.layers.N.something
-            return f'model.{key}'
-        
-        # Skip unknown keys
-        return None
+            # Fallback to direct copy
+            param.data.copy_(loaded_weight)
+    
+    def _load_weight_direct(self, param: torch.Tensor, loaded_weight: torch.Tensor):
+        """Load weight directly (for non-merged parameters)."""
+        if param.size() != loaded_weight.size():
+            logger.warning(f"Size mismatch: param {param.size()} vs loaded {loaded_weight.size()}")
+            return
+        param.data.copy_(loaded_weight)

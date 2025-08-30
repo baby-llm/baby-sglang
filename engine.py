@@ -371,11 +371,11 @@ def create_engine_from_hf(
     """
     Create GenerationEngine from HuggingFace Qwen2 model.
     
-    Automatically loads model configuration and weights from HF checkpoint.
+    Automatically downloads and loads model configuration and weights from HF Hub.
     Supports all Qwen2 model sizes (0.5B, 1.5B, 7B, etc.).
     
     Args:
-        hf_model_path: Path to HF model directory
+        hf_model_path: HF model identifier (e.g. "Qwen/Qwen2-1.5B") or local path
         device: Device to use ("auto", "cpu", "cuda", "mps")
         max_batch_size: Maximum batch size
         max_total_tokens: Maximum total tokens in memory
@@ -386,6 +386,8 @@ def create_engine_from_hf(
     """
     import json
     import os
+    from transformers import AutoConfig
+    from huggingface_hub import snapshot_download
     
     # Auto-detect device if needed
     if device == "auto":
@@ -399,13 +401,26 @@ def create_engine_from_hf(
     logger.info(f"Creating engine from HF model: {hf_model_path}")
     logger.info(f"Using device: {device}")
     
-    # Load HF model configuration
-    config_path = os.path.join(hf_model_path, "config.json")
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"config.json not found in {hf_model_path}")
+    # Download model from HuggingFace if it's not a local directory
+    if os.path.isdir(hf_model_path):
+        local_model_path = hf_model_path
+        logger.info(f"Using local model directory: {local_model_path}")
+    else:
+        logger.info(f"Downloading model from HuggingFace Hub: {hf_model_path}")
+        local_model_path = snapshot_download(
+            repo_id=hf_model_path,
+            allow_patterns=["*.json", "*.safetensors", "*.bin", "*.txt"],
+        )
+        logger.info(f"Model downloaded to: {local_model_path}")
     
-    with open(config_path, 'r') as f:
-        hf_config = json.load(f)
+    # Load HF model configuration using transformers
+    try:
+        hf_config_obj = AutoConfig.from_pretrained(local_model_path)
+        hf_config = hf_config_obj.to_dict()
+        logger.info(f"Loaded config: {hf_config.get('model_type', 'unknown')} model with {hf_config.get('hidden_size', 'unknown')} hidden size")
+    except Exception as e:
+        logger.error(f"Failed to load config from {local_model_path}: {e}")
+        raise
     
     # Create model config object
     class HFConfig:
@@ -420,10 +435,10 @@ def create_engine_from_hf(
     model = BabyQwen2ForCausalLM(config)
     
     # Load HF weights  
-    model.load_weights_from_hf(hf_model_path, device)
+    model.load_weights_from_hf(local_model_path, device)
     
     # Create tokenizer path (same as model path)
-    tokenizer_path = hf_model_path
+    tokenizer_path = local_model_path
     
     # Create engine
     engine = GenerationEngine(

@@ -1,6 +1,7 @@
 # Core dependencies for baby-sglang MVP
 torch>=2.0.0
 transformers>=4.30.0
+huggingface_hub>=0.16.0
 dataclasses>=0.6; python_version < "3.7"
 
 # Optional dependencies for advanced features (not required for MVP)
