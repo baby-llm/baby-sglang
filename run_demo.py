@@ -81,8 +81,7 @@ def run_baby_sglang_inference(engine, prompts: List[str]) -> Tuple[List[str], fl
     start_time = time.time()
     results = engine.generate(
         prompts=prompts,
-        sampling_params=sampling_params,
-        use_real_tokenizer=True
+        sampling_params=sampling_params
     )
     inference_time = time.time() - start_time
     
