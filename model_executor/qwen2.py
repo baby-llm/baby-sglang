@@ -170,6 +170,11 @@ class RotaryEmbedding(nn.Module):
         cos = torch.cos(freqs).unsqueeze(1)  # [seq_len, 1, head_dim//2]
         sin = torch.sin(freqs).unsqueeze(1)
         
+        # Expand cos/sin to match q/k num_heads dimension
+        num_heads = q.shape[1]
+        cos = cos.expand(-1, num_heads, -1)  # [seq_len, num_heads, head_dim//2]
+        sin = sin.expand(-1, num_heads, -1)
+        
         # Apply rotation
         q_rot = self._apply_rope(q, cos, sin)
         k_rot = self._apply_rope(k, cos, sin)
