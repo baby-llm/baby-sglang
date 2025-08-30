@@ -114,7 +114,6 @@ class SimplifiedRequest:
         # Check EOS token (early termination)
         if self.eos_token_id is not None and token_id == self.eos_token_id:
             should_finish = True
-            logger.debug(f"Request {self.request_id} finished due to EOS token")
         
         if should_finish:
             self.finished = True
@@ -169,7 +168,6 @@ class StaticBatchScheduler:
         self.waiting_requests.append(request)
         self.request_map[request.request_id] = request
         
-        logger.debug(f"Added request {request.request_id}, prompt_len={request.prompt_len}")
         return True
     
     def schedule_prefill_batch(self) -> Optional[SimplifiedForwardBatch]:
@@ -266,7 +264,6 @@ class StaticBatchScheduler:
             # Step 2: Build decode batch
             forward_batch = self._build_decode_batch(decode_ready, extended_tokens)
             
-            logger.debug(f"Scheduled decode batch: {len(decode_ready)} requests")
             return forward_batch
             
         except Exception as e:
@@ -289,14 +286,6 @@ class StaticBatchScheduler:
             seq_lens.append(req.prompt_len)
         
         # Convert to tensors
-        # This step converts Python lists to PyTorch tensors for efficient GPU computation:
-        # 1. Memory layout: Creates contiguous memory blocks that GPUs can process efficiently
-        # 2. Batching: Enables vectorized operations across multiple sequences simultaneously  
-        # 3. Device placement: Moves data to target device (CPU/GPU/MPS) for computation
-        # 4. Type safety: Ensures consistent data types (torch.long for token IDs)
-        # The conversion transforms irregular Python lists into regular tensor grids that
-        # can be processed by matrix operations and attention kernels in parallel.
-        # 为了最大化模型推理速度，PyTorch代码将数据复制到GPU，在那里完成所有中间计算（可通过张量的 .device 属性识别），并且仅在最后使用 .cpu() 将最终结果传回CPU，以便转换为人类可读的文本。
         input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.device)
         seq_lens = torch.tensor(seq_lens, dtype=torch.long, device=self.device)
         req_pool_indices = torch.tensor(req_pool_indices, dtype=torch.long, device=self.device)
@@ -379,7 +368,6 @@ class StaticBatchScheduler:
                 self.finished_requests.append(req)
                 to_remove.append(req)
                 
-                logger.debug(f"Cleaned up finished request {req.request_id}")
         
         # Remove from running
         for req in to_remove:
@@ -407,29 +395,3 @@ class StaticBatchScheduler:
         }
 
 
-# Phase 5 Summary:
-# ================
-# 
-# Implemented static batch scheduler with SGLang-aligned design:
-#
-# 1. SimplifiedRequest: 
-#    - Core fields from SGLang's Req class
-#    - Request lifecycle management
-#    - Memory resource tracking
-#
-# 2. StaticBatchScheduler:
-#    - Request queue management (waiting -> running -> finished)
-#    - Memory allocation using SGLang's memory pools
-#    - Batch construction for prefill/decode phases
-#    - Resource cleanup and error handling
-#
-# 3. SGLang compatibility:
-#    - Uses req_to_token_pool and token_to_kv_pool
-#    - Follows ScheduleBatch memory allocation patterns
-#    - Compatible with SimplifiedForwardBatch
-#
-# 4. Ready for Phase 6:
-#    - Prefill/decode batch scheduling
-#    - Memory lifecycle management
-#    - Request state tracking
-#    - Error handling and cleanup

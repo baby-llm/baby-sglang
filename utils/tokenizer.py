@@ -136,7 +136,6 @@ class BabyTokenizer:
                 token_id = self.tokenizer.token_to_id(token)
                 if token_id is not None:
                     setattr(self, attr_name, token_id)
-                    logger.debug(f"Set {attr_name} = {token_id} ('{token}')")
         
         # Set vocab size
         self.vocab_size = self.tokenizer.get_vocab_size()
@@ -212,31 +211,3 @@ def create_tokenizer(
     return BabyTokenizer(model_path_or_name, **kwargs)
 
 
-# Real Tokenizer Implementation Summary:
-# ======================================
-#
-# Complete real tokenizer implementation using tokenizers library:
-#
-# 1. BabyTokenizer class:
-#    - Loads tokenizer.json from local path 
-#    - Extracts special tokens (eos, pad, bos, unk) from config
-#    - Provides encode/decode interface compatible with SGLang
-#    - Requires real tokenizer files - no fallback
-#
-# 2. Key methods:
-#    - encode(text) -> List[int]: Tokenize text to IDs
-#    - decode(ids) -> str: Detokenize IDs to text
-#    - get_vocab_size() -> int: Get vocabulary size
-#    - get_special_tokens_dict(): Get special token mappings
-#
-# 3. Features:
-#    - Real tokenizers library integration
-#    - Special token handling from tokenizer config
-#    - SGLang-compatible interface
-#    - Local model file support
-#    - Proper error handling
-#
-# 4. Requirements:
-#    - tokenizers library must be installed
-#    - Local tokenizer files (tokenizer.json, tokenizer_config.json)
-#    - No mock fallback - fails if real tokenizer unavailable

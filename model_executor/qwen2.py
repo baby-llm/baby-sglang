@@ -768,9 +768,7 @@ class BabyQwen2ForCausalLM(nn.Module):
             
             if our_key:
                 mapped_dict[our_key] = tensor
-                logger.debug(f"Mapped: {hf_key} -> {our_key}")
             else:
-                logger.debug(f"Skipped unmappable key: {hf_key}")
         
         logger.info(f"Mapped {len(mapped_dict)}/{len(hf_state_dict)} weight tensors")
         return mapped_dict

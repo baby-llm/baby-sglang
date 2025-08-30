@@ -122,7 +122,6 @@ class GenerationEngine:
         for prompt in prompts:
             # Real tokenization
             input_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-            logger.debug(f"Tokenization: '{prompt[:50]}...' -> {len(input_ids)} tokens")
             
             request = SimplifiedRequest(
                 request_id=f"req_{self.request_counter}",
@@ -157,7 +156,6 @@ class GenerationEngine:
                         skip_special_tokens=True
                     )
                     full_text = request.input_text + output_text
-                    logger.debug(f"Detokenization: {len(request.output_ids)} tokens -> '{output_text[:50]}...'")
                     results.append(full_text)
                 else:
                     logger.warning(f"Request {request.request_id} did not finish properly")
@@ -236,7 +234,6 @@ class GenerationEngine:
             # Update requests
             self.scheduler.update_requests_with_tokens(decode_requests, new_tokens)
             
-            logger.debug(f"Decode step {step+1}: generated tokens for {len(decode_requests)} requests")
         
         # Step 3: Cleanup
         self.scheduler.cleanup_finished_requests()
@@ -498,34 +495,3 @@ def create_test_engine(
     )
     
     return engine
-
-
-# Phase 7 Summary:
-# ================
-#
-# Real tokenizer integration completed:
-#
-# 1. BabyTokenizer integration:
-#    - Uses tokenizers library for real tokenization
-#    - Automatic fallback to mock for testing
-#    - Special tokens support (eos, pad, bos, unk)
-#    - Local and HuggingFace model support
-#
-# 2. GenerationEngine updates:
-#    - Real tokenizer as instance variable
-#    - encode/decode using BabyTokenizer
-#    - Backward compatibility with mock mode
-#    - Enhanced stats with tokenizer info
-#
-# 3. Phase 7 features:
-#    - Real tokenization: encode(text) -> List[int]
-#    - Real detokenization: decode(ids) -> str
-#    - Special token handling from config
-#    - Graceful fallback if tokenizer fails
-#    - Enhanced debugging and logging
-#
-# 4. Ready for Phase 8:
-#    - Complete testing and validation
-#    - Unit tests for all components
-#    - Integration tests for full pipeline
-#    - Performance sanity checks
