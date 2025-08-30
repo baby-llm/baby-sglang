@@ -192,13 +192,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
     def get_key_buffer(self, layer_id: int):
         """Get key buffer for layer."""
         if self.store_dtype != self.dtype:
-            return self.k_buffer[layer_id].view(self.dtype)
+            raise NotImplementedError("float8 KV cache read is not supported in baby-sglang MVP")
         return self.k_buffer[layer_id]
 
     def get_value_buffer(self, layer_id: int):
         """Get value buffer for layer."""
         if self.store_dtype != self.dtype:
-            return self.v_buffer[layer_id].view(self.dtype)
+            raise NotImplementedError("float8 KV cache read is not supported in baby-sglang MVP")
         return self.v_buffer[layer_id]
 
     def get_kv_buffer(self, layer_id: int):
@@ -219,8 +219,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             cache_v = cache_v.to(self.dtype)
             
         if self.store_dtype != self.dtype:
-            self.k_buffer[layer_id][loc] = cache_k.view(self.store_dtype)
-            self.v_buffer[layer_id][loc] = cache_v.view(self.store_dtype)
+            raise NotImplementedError("float8 KV cache write is not supported in baby-sglang MVP")
         else:
             self.k_buffer[layer_id][loc] = cache_k
             self.v_buffer[layer_id][loc] = cache_v

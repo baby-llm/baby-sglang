@@ -18,6 +18,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 
 logger = logging.getLogger(__name__)
@@ -261,8 +264,7 @@ class SimpleAttentionBackend:
                 q_sdpa, k_sdpa, v_sdpa,
                 attn_mask=None, # None because is_causal=True handles causal masking internally in PyTorch SDPA
                 dropout_p=0.0,
-                is_causal=True,  # Causal only within this request
-                scale=scaling
+                is_causal=True  # Causal only within this request
             )
             
             # Reshape back and flatten: [seq_len, num_heads * head_dim]
@@ -287,7 +289,7 @@ class SimpleAttentionBackend:
         
         # Causal self-attention
         out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True, scale=scaling
+            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
         )
         
         # Reshape back: [seq_len, num_heads * head_dim]
@@ -339,8 +341,7 @@ class SimpleAttentionBackend:
                 q_sdpa, k_sdpa, v_sdpa,
                 attn_mask=None,
                 dropout_p=0.0,
-                is_causal=False,  # No causal mask needed for decode (SGLang's approach)
-                scale=scaling
+                is_causal=False  # No causal mask needed for decode (SGLang's approach)
             )
             
             # Reshape back: [1, num_heads * head_dim]
@@ -664,87 +665,185 @@ class BabyQwen2ForCausalLM(nn.Module):
     
     def load_weights_from_hf(self, hf_model_path: str, device: str = "auto"):
         """
-        Load weights from HuggingFace checkpoint using transformers library.
-        
-        Simplified approach following SGLang patterns - let transformers handle the heavy lifting.
-        
-        Args:
-            hf_model_path: Path to HF model directory
-            device: Device to load weights on ("auto", "cpu", "cuda", "mps")
+        Load weights from a HuggingFace checkpoint into the simplified model.
+        Chooses dtype by device: float16 for CUDA/MPS, float32 for CPU.
         """
         try:
             from transformers import AutoModelForCausalLM
             import torch
-            
+
             logger.info(f"Loading Qwen2 weights from: {hf_model_path}")
-            
-            # Load HuggingFace model to get the state_dict
-            logger.info("Loading HuggingFace model...")
+
+            # Resolve device and dtype
+            target_device = device
+            if device == "auto":
+                if torch.cuda.is_available():
+                    target_device = "cuda"
+                elif torch.backends.mps.is_available():
+                    target_device = "mps"
+                else:
+                    target_device = "cpu"
+            torch_dtype = torch.float16 if target_device in ("cuda", "mps") else torch.float32
+
+            # Load HuggingFace model on CPU to read state dict
+            logger.info("Loading HuggingFace model (CPU) to fetch state_dict...")
             hf_model = AutoModelForCausalLM.from_pretrained(
                 hf_model_path,
-                torch_dtype=torch.float16,  # Use FP16 for efficiency
-                device_map="cpu",  # Load to CPU first
-                trust_remote_code=True
+                torch_dtype=torch_dtype,
+                device_map="cpu",
+                trust_remote_code=True,
             )
-            
-            # Get the state dict from HuggingFace model
-            hf_state_dict = hf_model.state_dict()
-            logger.info(f"Loaded {len(hf_state_dict)} weight tensors from HuggingFace model")
-            
-            # Load weights using SGLang-style iterator
-            weights_iterator = ((name, tensor) for name, tensor in hf_state_dict.items())
-            self.load_weights(weights_iterator)
-            
-            # Clean up HF model to save memory
+
+            state = hf_model.state_dict()
+            logger.info(f"Loaded {len(state)} tensors from HuggingFace model")
+
+            # Copy into our simplified model
+            self.load_weights(state)
+
+            # Move to target device and dtype
+            self.to(device=target_device, dtype=torch_dtype)
+
+            # Cleanup
             del hf_model
-            torch.cuda.empty_cache()
-            
-            logger.info(f"Successfully loaded Qwen2 weights from {hf_model_path}")
-            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            logger.info(f"Successfully loaded Qwen2 weights from {hf_model_path} onto {target_device} with dtype={torch_dtype}")
+
         except Exception as e:
             logger.error(f"Failed to load HF weights: {e}")
             raise
     
     def load_weights(self, weights):
         """
-        Load weights using SGLang's approach with proper weight mapping.
-        
-        This method follows SGLang's load_weights pattern from qwen2.py.
+        Load weights from a HuggingFace state_dict into the simplified model.
+        Supports merged QKV and merged Gate/Up projections.
         """
-        # SGLang-style stacked parameter mappings for merged weights
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)  
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"), 
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            # Skip rotary embeddings and other unused weights
-            if "rotary_emb.inv_freq" in name or "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+        import re
+        import torch
+
+        # Accept dict or iterator
+        state = weights if isinstance(weights, dict) else dict(weights)
+        params = dict(self.named_parameters())
+
+        # Shapes derived from config
+        cfg = self.config
+        head_dim = cfg.hidden_size // cfg.num_attention_heads
+        q_size = cfg.num_attention_heads * head_dim
+        kv_size = cfg.num_key_value_heads * head_dim
+        inter = cfg.intermediate_size
+
+        def copy_param(dst_name: str, src_tensor: torch.Tensor):
+            if dst_name not in params:
+                return
+            dst = params[dst_name]
+            if dst.data.shape != src_tensor.shape:
+                logger.warning(f"Size mismatch for {dst_name}: {tuple(dst.data.shape)} vs {tuple(src_tensor.shape)}")
+                return
+            dst.data.copy_(src_tensor.to(dst.dtype))
+
+        layer_pat = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
+
+        for name, tensor in state.items():
+            # Top-level weights
+            if name == "model.embed_tokens.weight":
+                copy_param("model.embed_tokens.weight", tensor)
                 continue
-                
-            # Handle stacked parameter mapping (like SGLang)  
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                
-                # Load the shard
-                self._load_weight_shard(param, loaded_weight, shard_id)
-                break
-            else:
-                # Direct weight loading
-                if name not in params_dict:
-                    continue  # Skip unknown weights
-                param = params_dict[name]
-                self._load_weight_direct(param, loaded_weight)
+            if name == "model.norm.weight":
+                copy_param("model.norm.weight", tensor)
+                continue
+            if name == "lm_head.weight":
+                # Copy only if not tied to embeddings
+                if hasattr(self, "lm_head") and (not hasattr(self.model, "embed_tokens") or self.lm_head is not self.model.embed_tokens):
+                    copy_param("lm_head.weight", tensor)
+                continue
+
+            # Per-layer weights
+            m = layer_pat.match(name)
+            if not m:
+                # Skip unknown keys (e.g., rotary tables, caches)
+                continue
+            lid = int(m.group(1))
+            rest = m.group(2)
+
+            # Attention QKV merged into qkv_proj.qkv_proj
+            if rest == "self_attn.q_proj.weight":
+                p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.weight", None)
+                if p is not None:
+                    p.data[:q_size].copy_(tensor.to(p.dtype))
+                continue
+            if rest == "self_attn.q_proj.bias":
+                p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.bias", None)
+                if p is not None:
+                    p.data[:q_size].copy_(tensor.to(p.dtype))
+                continue
+
+            if rest == "self_attn.k_proj.weight":
+                p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.weight", None)
+                if p is not None:
+                    p.data[q_size:q_size + kv_size].copy_(tensor.to(p.dtype))
+                continue
+            if rest == "self_attn.k_proj.bias":
+                p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.bias", None)
+                if p is not None:
+                    p.data[q_size:q_size + kv_size].copy_(tensor.to(p.dtype))
+                continue
+
+            if rest == "self_attn.v_proj.weight":
+                p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.weight", None)
+                if p is not None:
+                    p.data[q_size + kv_size:].copy_(tensor.to(p.dtype))
+                continue
+            if rest == "self_attn.v_proj.bias":
+                p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.bias", None)
+                if p is not None:
+                    p.data[q_size + kv_size:].copy_(tensor.to(p.dtype))
+                continue
+
+            if rest == "self_attn.o_proj.weight":
+                copy_param(f"model.layers.{lid}.self_attn.o_proj.weight", tensor)
+                continue
+            if rest == "self_attn.o_proj.bias":
+                copy_param(f"model.layers.{lid}.self_attn.o_proj.bias", tensor)
+                continue
+
+            # MLP merged Gate/Up into gate_up_proj.gate_up_proj
+            if rest == "mlp.gate_proj.weight":
+                p = params.get(f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.weight", None)
+                if p is not None:
+                    p.data[:inter].copy_(tensor.to(p.dtype))
+                continue
+            if rest == "mlp.gate_proj.bias":
+                p = params.get(f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.bias", None)
+                if p is not None:
+                    p.data[:inter].copy_(tensor.to(p.dtype))
+                continue
+
+            if rest == "mlp.up_proj.weight":
+                p = params.get(f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.weight", None)
+                if p is not None:
+                    p.data[inter:].copy_(tensor.to(p.dtype))
+                continue
+            if rest == "mlp.up_proj.bias":
+                p = params.get(f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.bias", None)
+                if p is not None:
+                    p.data[inter:].copy_(tensor.to(p.dtype))
+                continue
+
+            if rest == "mlp.down_proj.weight":
+                copy_param(f"model.layers.{lid}.mlp.down_proj.weight", tensor)
+                continue
+            if rest == "mlp.down_proj.bias":
+                copy_param(f"model.layers.{lid}.mlp.down_proj.bias", tensor)
+                continue
+
+            # Norms
+            if rest == "input_layernorm.weight":
+                copy_param(f"model.layers.{lid}.input_layernorm.weight", tensor)
+                continue
+            if rest == "post_attention_layernorm.weight":
+                copy_param(f"model.layers.{lid}.post_attention_layernorm.weight", tensor)
+                continue
     
     def _load_weight_shard(self, param: torch.Tensor, loaded_weight: torch.Tensor, shard_id):
         """Load weight into a specific shard (for merged parameters like qkv_proj)."""
@@ -780,3 +879,167 @@ class BabyQwen2ForCausalLM(nn.Module):
             logger.warning(f"Size mismatch: param {param.size()} vs loaded {loaded_weight.size()}")
             return
         param.data.copy_(loaded_weight)
+# ========= Convenience config and HF loader/test helpers (appended for TODO#1) =========
+
+@dataclass
+class BabyQwenConfig:
+    hidden_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    intermediate_size: int
+    num_hidden_layers: int
+    vocab_size: int
+    rms_norm_eps: float = 1e-6
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 32768
+    rope_theta: float = 1000000.0
+    rope_scaling: Optional[Dict[str, Any]] = None
+    tie_word_embeddings: bool = False
+
+    @classmethod
+    def from_hf(cls, model_id: str):
+        from transformers import AutoConfig
+        hf_cfg = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+        return cls(
+            hidden_size=getattr(hf_cfg, "hidden_size"),
+            num_attention_heads=getattr(hf_cfg, "num_attention_heads"),
+            num_key_value_heads=getattr(hf_cfg, "num_key_value_heads", getattr(hf_cfg, "num_kv_heads", None)),
+            intermediate_size=getattr(hf_cfg, "intermediate_size"),
+            num_hidden_layers=getattr(hf_cfg, "num_hidden_layers"),
+            vocab_size=getattr(hf_cfg, "vocab_size"),
+            rms_norm_eps=getattr(hf_cfg, "rms_norm_eps", 1e-6),
+            hidden_act=getattr(hf_cfg, "hidden_act", "silu"),
+            max_position_embeddings=getattr(hf_cfg, "max_position_embeddings", 32768),
+            rope_theta=getattr(hf_cfg, "rope_theta", 1000000.0),
+            rope_scaling=getattr(hf_cfg, "rope_scaling", None),
+            tie_word_embeddings=getattr(hf_cfg, "tie_word_embeddings", False),
+        )
+
+
+def build_model_from_hf(model_id: str, device: str = "auto") -> BabyQwen2ForCausalLM:
+    """
+    Create BabyQwen2ForCausalLM from a HuggingFace model id by adapting the HF config
+    and then copying weights into the simplified architecture.
+    """
+    cfg = BabyQwenConfig.from_hf(model_id)
+    # Some HF configs may miss num_key_value_heads; default to num_attention_heads
+    if cfg.num_key_value_heads is None:
+        cfg.num_key_value_heads = cfg.num_attention_heads
+
+    model = BabyQwen2ForCausalLM(cfg)
+    model.eval()
+    model.load_weights_from_hf(model_id, device=device)
+    return model
+
+
+def _best_device_str(device: str = "auto") -> Tuple[str, torch.dtype]:
+    if device != "auto":
+        dt = torch.float16 if device in ("cuda", "mps") else torch.float32
+        return device, dt
+    if torch.cuda.is_available():
+        return "cuda", torch.float16
+    if torch.backends.mps.is_available():
+        return "mps", torch.float16
+    return "cpu", torch.float32
+
+
+def simple_prefill_test(model_id: str = "Qwen/Qwen2.5-0.5B", prompt: str = "Hello, how are you?"):
+    """
+    Minimal verification: load HF weights into simplified model, run a single prefill forward,
+    and print the next-token greedy prediction.
+    """
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+
+    # Build model and tokenizer
+    model = build_model_from_hf(model_id, device="auto")
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=True)
+
+    # Tokenize prompt
+    enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+    input_ids = enc["input_ids"].squeeze(0)  # [L]
+    L = input_ids.numel()
+
+    # Resolve device/dtype from model
+    p = next(model.parameters())
+    device = p.device
+    dtype = p.dtype
+
+    input_ids = input_ids.to(device)
+
+    # Create memory pools
+    # KV pool uses num_kv_heads and head_dim
+    num_heads = model.config.num_attention_heads
+    num_kv_heads = model.config.num_key_value_heads
+    head_dim = model.config.hidden_size // num_heads
+    kv_dtype = torch.float16 if device.type in ("cuda", "mps") else torch.float32
+
+    token_to_kv_pool = MHATokenToKVPool(
+        size=L,
+        dtype=kv_dtype,
+        head_num=num_kv_heads,
+        head_dim=head_dim,
+        layer_num=model.config.num_hidden_layers,
+        device=str(device),
+    )
+
+    req_to_token_pool = ReqToTokenPool(
+        size=1,
+        max_context_len=L,
+        device=str(device),
+    )
+
+    # Allocate KV slots and map request->token slots
+    out_cache_loc = token_to_kv_pool.alloc(L)  # int32 on device
+    mapping_row = torch.zeros(L, dtype=torch.int32, device=device)
+    mapping_row[:L] = out_cache_loc
+    # Write into req_to_token_pool for request index 0
+    req_to_token_pool.write(0, mapping_row)
+
+    # Build forward batch (prefill)
+    req_pool_indices = torch.tensor([0], dtype=torch.long, device=device)
+    seq_lens = torch.tensor([L], dtype=torch.long, device=device)
+
+    fwd_batch = SimplifiedForwardBatch.create_prefill_batch(
+        input_ids=input_ids,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        out_cache_loc=out_cache_loc,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool=token_to_kv_pool,
+    )
+
+    # Positions [0..L-1]
+    positions = torch.arange(L, dtype=torch.long, device=device)
+
+    # Forward to get logits and greedy next token
+    with torch.no_grad():
+        logits = model(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=fwd_batch,
+            input_embeds=None,
+        )
+
+    last_logits = logits[-1]  # [vocab_size]
+    next_id = int(torch.argmax(last_logits, dim=-1).item())
+
+    # Decode and print
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    next_token_text = tokenizer.decode(next_id, skip_special_tokens=True)
+    print("=" * 40)
+    print("baby-sglang Qwen2.5-0.5B simple prefill test")
+    print(f"Prompt: {prompt}")
+    print(f"Next token id: {next_id}")
+    print(f"Next token text: {repr(next_token_text)}")
+    print("=" * 40)
+
+
+if __name__ == "__main__":
+    # Run a quick verification when invoked directly
+    try:
+        simple_prefill_test()
+    except Exception as _e:
+        logger.exception(f"Simple prefill test failed: {_e}")
