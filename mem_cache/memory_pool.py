@@ -213,11 +213,15 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         cache_v: torch.Tensor,
     ):
         """Set KV cache data at token locations."""
+        # Ensure index dtype is correct for advanced indexing
+        if loc.dtype != torch.long:
+            loc = loc.long()
+
         # Handle dtype conversion like SGLang
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
-            
+
         if self.store_dtype != self.dtype:
             raise NotImplementedError("float8 KV cache write is not supported in baby-sglang MVP")
         else:

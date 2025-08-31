@@ -167,28 +167,35 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
     
     def forward(self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor):
-        """Apply RoPE to q and k tensors (SGLang-compatible signature)."""
-        # positions: [total_tokens], q/k: [total_tokens, num_heads, head_dim]
+        """
+        Apply RoPE to q and k tensors (SGLang-compatible signature).
+        positions: [total_tokens]
+        q: [total_tokens, num_heads, head_dim]
+        k: [total_tokens, num_kv_heads, head_dim]  # GQA supported
+        """
+        # Compute cos/sin without expanding to the head dimension to support GQA.
         freqs = torch.outer(positions.float(), self.inv_freq)  # [total_tokens, head_dim//2]
-        cos = torch.cos(freqs).unsqueeze(1)  # [total_tokens, 1, head_dim//2]
-        sin = torch.sin(freqs).unsqueeze(1)
-        
-        # Expand cos/sin to match q/k num_heads dimension
-        num_heads = q.shape[1]
-        cos = cos.expand(-1, num_heads, -1)  # [total_tokens, num_heads, head_dim//2]
-        sin = sin.expand(-1, num_heads, -1)
-        
-        # Apply rotation
+        cos = torch.cos(freqs)  # [total_tokens, head_dim//2]
+        sin = torch.sin(freqs)  # [total_tokens, head_dim//2]
+
+        # Apply rotation (broadcast across head dimension)
         q_rot = self._apply_rope(q, cos, sin)
         k_rot = self._apply_rope(k, cos, sin)
-        
+
         return q_rot, k_rot
-    
+
     def _apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-        """Apply rotary position embedding."""
-        # x: [total_tokens, num_heads, head_dim]
-        # cos/sin: [total_tokens, num_heads, head_dim//2]
-        x1, x2 = x.chunk(2, dim=-1)  # Each: [total_tokens, num_heads, head_dim//2]
+        """
+        Apply rotary position embedding with broadcasting across heads.
+        x: [total_tokens, any_head_count, head_dim]
+        cos/sin: [total_tokens, head_dim//2]
+        """
+        # Prepare cos/sin for broadcasting over the head axis and match dtype
+        cos = cos.unsqueeze(1).to(x.dtype)  # [total_tokens, 1, head_dim//2]
+        sin = sin.unsqueeze(1).to(x.dtype)  # [total_tokens, 1, head_dim//2]
+
+        # Split last dimension into two halves and apply rotation
+        x1, x2 = x.chunk(2, dim=-1)  # [total_tokens, any_head_count, head_dim//2] each
         return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
 
 
@@ -310,12 +317,16 @@ class SimpleAttentionBackend:
         q_offset = 0
         
         for i, seq_len in enumerate(forward_batch.seq_lens):
+            # Normalize scalar tensor to Python int for slicing and indexing
+            seq_len = int(seq_len.item()) if hasattr(seq_len, "item") else int(seq_len)
+
             # Single query token for this request (SGLang's approach)
             per_req_q = q[q_offset:q_offset + 1]  # [1, num_heads, head_dim]
             
             # Get this request's full context from KV cache using SGLang's indexing
-            req_pool_idx = forward_batch.req_pool_indices[i]
-            token_indices = forward_batch.req_to_token_pool.req_to_token[req_pool_idx, :seq_len]
+            # Ensure row index is a Python int and token indices are torch.long for advanced indexing
+            req_pool_idx = int(forward_batch.req_pool_indices[i].item())
+            token_indices = forward_batch.req_to_token_pool.req_to_token[req_pool_idx, :seq_len].long()
             
             # Gather full context K,V for this request from cache (SGLang's core operation)
             k_buffer, v_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer_id)
@@ -667,6 +678,7 @@ class BabyQwen2ForCausalLM(nn.Module):
         """
         Load weights from a HuggingFace checkpoint into the simplified model.
         Chooses dtype by device: float16 for CUDA/MPS, float32 for CPU.
+        Avoids requiring `accelerate` by not using `device_map`.
         """
         try:
             from transformers import AutoModelForCausalLM
@@ -685,13 +697,13 @@ class BabyQwen2ForCausalLM(nn.Module):
                     target_device = "cpu"
             torch_dtype = torch.float16 if target_device in ("cuda", "mps") else torch.float32
 
-            # Load HuggingFace model on CPU to read state dict
+            # Load HuggingFace model on CPU to read state dict (no accelerate needed)
             logger.info("Loading HuggingFace model (CPU) to fetch state_dict...")
             hf_model = AutoModelForCausalLM.from_pretrained(
                 hf_model_path,
                 torch_dtype=torch_dtype,
-                device_map="cpu",
                 trust_remote_code=True,
+                low_cpu_mem_usage=False  # ensure standard torch.load path without accelerate
             )
 
             state = hf_model.state_dict()
@@ -1037,9 +1049,150 @@ def simple_prefill_test(model_id: str = "Qwen/Qwen2.5-0.5B", prompt: str = "Hell
     print("=" * 40)
 
 
+def simple_decode_test(
+    model_id: str = "Qwen/Qwen2.5-0.5B",
+    prompts: Optional[List[str]] = None,
+    max_new_tokens: int = 64,
+):
+    """
+    Simple end-to-end decode test on several prompts using the baby-sglang execution path:
+    - Prefill to populate KV for the prompt
+    - Iterative decode with per-token KV write + per-request attention read
+    Greedy decoding only for MVP.
+    """
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+
+    # Default prompts to cover English/Chinese and code
+    if prompts is None:
+        prompts = [
+            "Hello, introduce yourself briefly.",
+            "用中文介绍一下量子计算的基本原理。",
+            "Write a Python function to compute Fibonacci numbers efficiently.",
+            "给出三条关于上海旅游的建议。",
+        ]
+
+    # Build model + tokenizer once
+    model = build_model_from_hf(model_id, device="auto")
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=True)
+
+    # Resolve device/dtype from model
+    p = next(model.parameters())
+    device = p.device
+    dtype = p.dtype
+
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id
+
+    for prompt in prompts:
+        # Tokenize prompt
+        enc = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+        input_ids_full = enc["input_ids"].squeeze(0).to(device)
+        L = int(input_ids_full.numel())
+
+        # Create pools sized for prompt + generation
+        num_heads = model.config.num_attention_heads
+        num_kv_heads = model.config.num_key_value_heads
+        head_dim = model.config.hidden_size // num_heads
+        kv_dtype = torch.float16 if device.type in ("cuda", "mps") else torch.float32
+
+        token_to_kv_pool = MHATokenToKVPool(
+            size=L + max_new_tokens,
+            dtype=kv_dtype,
+            head_num=num_kv_heads,
+            head_dim=head_dim,
+            layer_num=model.config.num_hidden_layers,
+            device=str(device),
+        )
+        req_to_token_pool = ReqToTokenPool(
+            size=1,
+            max_context_len=L + max_new_tokens,
+            device=str(device),
+        )
+
+        # Allocate KV slots for prefill and map request->token slots
+        prefill_locs = token_to_kv_pool.alloc(L)  # [L] int32 on device
+        mapping_row = torch.zeros(L + max_new_tokens, dtype=torch.int32, device=device)
+        mapping_row[:L] = prefill_locs
+        req_to_token_pool.write(0, mapping_row)
+
+        # Prefill batch
+        fwd_batch = SimplifiedForwardBatch.create_prefill_batch(
+            input_ids=input_ids_full,
+            req_pool_indices=torch.tensor([0], dtype=torch.long, device=device),
+            seq_lens=torch.tensor([L], dtype=torch.long, device=device),
+            out_cache_loc=prefill_locs,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool=token_to_kv_pool,
+        )
+        positions = torch.arange(L, dtype=torch.long, device=device)
+
+        # Prefill forward to get first next-token logits
+        with torch.no_grad():
+            logits = model(
+                input_ids=input_ids_full,
+                positions=positions,
+                forward_batch=fwd_batch,
+                input_embeds=None,
+            )
+        last_logits = logits[-1]
+        next_id = int(torch.argmax(last_logits, dim=-1).item())
+
+        # Greedy decode loop
+        generated_ids: List[int] = []
+        steps = 0
+        while steps < max_new_tokens:
+            # Append the token we are about to feed (so EOS appears in output if selected)
+            generated_ids.append(next_id)
+            if eos_id is not None and next_id == eos_id:
+                break
+
+            # Allocate KV slot for this new token and update request->token map
+            new_loc = token_to_kv_pool.alloc(1)  # shape [1], int32 on device
+            # Current sequence length after adding this token
+            cur_len = L + len(generated_ids)
+            # Write new location into the mapping
+            req_to_token_pool.req_to_token[0, cur_len - 1] = new_loc[0]
+
+            # Build decode batch: feed the last generated token
+            dec_input = torch.tensor([next_id], dtype=torch.long, device=device)
+            dec_fwd = SimplifiedForwardBatch.create_decode_batch(
+                input_ids=dec_input,
+                req_pool_indices=torch.tensor([0], dtype=torch.long, device=device),
+                seq_lens=torch.tensor([cur_len], dtype=torch.long, device=device),
+                out_cache_loc=new_loc,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool=token_to_kv_pool,
+            )
+            dec_positions = dec_fwd.positions  # seq_lens - 1
+
+            # Forward for next logits
+            with torch.no_grad():
+                dec_logits = model(
+                    input_ids=dec_input,
+                    positions=dec_positions,
+                    forward_batch=dec_fwd,
+                    input_embeds=None,
+                )
+            # Since batch=1 and one token, take [0]
+            next_id = int(torch.argmax(dec_logits[0], dim=-1).item())
+            steps += 1
+
+        # Decode completion text
+        completion = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+        print("=" * 40)
+        print("baby-sglang Qwen2.5-0.5B simple decode test")
+        print(f"Prompt: {prompt}")
+        print(f"Completion: {completion!r}")
+        print("=" * 40)
+        
 if __name__ == "__main__":
-    # Run a quick verification when invoked directly
+    # Run quick verifications when invoked directly
     try:
         simple_prefill_test()
+        simple_decode_test()
     except Exception as _e:
-        logger.exception(f"Simple prefill test failed: {_e}")
+        logger.exception(f"Simple test failed: {_e}")
