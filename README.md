@@ -10,9 +10,10 @@ python -m test_qwen2 --mode decode --model-id Qwen/Qwen2.5-0.5B --preset cn --ma
 
 ## Roadmap
 
-- ✅ Qwen2 baseline support
-- ✅ Paged Attention
+- ✅ Qwen2 support
+- ✅ Paged attention
 - ✅ Dynamic batching
 - 🚧 Radix attention
 - 🚧 Asynchronous processing
 - 🚧 Multiple level cache
+- 🚧 TP PP DP support
