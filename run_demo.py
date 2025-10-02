@@ -1,12 +1,19 @@
+#!/usr/bin/env python3
+"""
+Smoke test for Engine.generate() method.
+This test file replicates the logic from test_qwen2.py but uses the high-level Engine interface.
+"""
+
 import argparse
 from typing import List, Optional
 import torch
-from transformers import AutoTokenizer
-from model_loader import build_model_from_hf
-from forward_batch import SimplifiedForwardBatch
-from memory_pool import ReqToTokenPool, MHATokenToKVPool
+
+from engine import Engine
+from sample import SamplingParams
+
 
 def get_builtin_prompts(preset: str) -> List[str]:
+    """Get built-in test prompts - copied from test_qwen2.py"""
     if preset == "en":
         return [
             "Summarize the key benefits of unit testing in software engineering.",
@@ -49,248 +56,185 @@ def get_builtin_prompts(preset: str) -> List[str]:
         "给出三条关于上海旅游的建议。",
     ]
 
-def sample_next_ids(logits: torch.Tensor, do_sample: bool, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
-    if not do_sample:
-        return torch.argmax(logits, dim=-1)
-    if temperature is None or temperature <= 0:
-        temperature = 1.0
-    scaled = logits / temperature
-    if top_k and top_k > 0:
-        kth = torch.topk(scaled, k=min(top_k, scaled.shape[-1]), dim=-1).values[..., -1:].expand_as(scaled)
-        scaled = torch.where(scaled < kth, torch.full_like(scaled, float("-inf")), scaled)
-    if top_p and top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(scaled, descending=True, dim=-1)
-        sorted_probs = torch.softmax(sorted_logits, dim=-1)
-        cumsum = torch.cumsum(sorted_probs, dim=-1)
-        cutoff = cumsum > top_p
-        cutoff[..., 0] = False
-        sorted_logits = torch.where(cutoff, torch.full_like(sorted_logits, float("-inf")), sorted_logits)
-        scaled = torch.full_like(scaled, float("-inf"))
-        scaled.scatter_(-1, sorted_indices, sorted_logits)
-    probs = torch.softmax(scaled, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-def create_prefill_test(
-    model_id: str = "Qwen/Qwen2.5-0.5B",
+def test_engine_basic_generation(
+    model_id: str = "Qwen/qwen2.5-1.5B",
     prompts: Optional[List[str]] = None,
     preset: str = "mix",
+    max_new_tokens: int = 32,
     do_sample: bool = False,
     temperature: float = 1.0,
     top_k: int = 0,
     top_p: float = 1.0,
     seed: Optional[int] = None,
 ):
+    """
+    Smoke test for basic generation functionality.
+    Similar to create_decode_test in run_demo.py but uses Engine.generate().
+    """
     if prompts is None or len(prompts) == 0:
         prompts = get_builtin_prompts(preset)
-    if seed is not None:
-        torch.manual_seed(seed)
-    model = build_model_from_hf(model_id, device="auto")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=True)
-    p = next(model.parameters())
-    device = p.device
-    ids_list: List[torch.Tensor] = []
-    lens: List[int] = []
-    for s in prompts:
-        enc = tokenizer(s, return_tensors="pt", add_special_tokens=False)
-        ids = enc["input_ids"].squeeze(0).to(device)
-        ids_list.append(ids)
-        lens.append(int(ids.numel()))
-    B = len(ids_list)
-    L_max = max(lens)
-    L_total = sum(lens)
-    concat_ids = torch.cat(ids_list, dim=0)
-    num_heads = model.config.num_attention_heads
-    num_kv_heads = model.config.num_key_value_heads
-    head_dim = model.config.hidden_size // num_heads
-    kv_dtype = torch.float16 if device.type in ("cuda", "mps") else torch.float32
-    token_to_kv_pool = MHATokenToKVPool(
-        size=L_total,
-        dtype=kv_dtype,
-        head_num=num_kv_heads,
-        head_dim=head_dim,
-        layer_num=model.config.num_hidden_layers,
-        device=str(device),
-    )
-    req_to_token_pool = ReqToTokenPool(
-        size=B,
-        max_context_len=L_max,
-        device=str(device),
-    )
-    out_cache_loc = token_to_kv_pool.alloc(L_total)
-    mapping = torch.zeros((B, L_max), dtype=torch.int32, device=device)
-    offsets = [0]
-    for n in lens:
-        offsets.append(offsets[-1] + n)
-    for i in range(B):
-        s, e = offsets[i], offsets[i + 1]
-        mapping[i, : lens[i]] = out_cache_loc[s:e]
-    req_indices = torch.arange(B, dtype=torch.long, device=device)
-    req_to_token_pool.write(req_indices, mapping)
-    seq_lens = torch.tensor(lens, dtype=torch.long, device=device)
-    fwd_batch = SimplifiedForwardBatch.create_prefill_batch(
-        input_ids=concat_ids,
-        req_pool_indices=req_indices,
-        seq_lens=seq_lens,
-        out_cache_loc=out_cache_loc,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool=token_to_kv_pool,
-    )
-    with torch.no_grad():
-        logits = model(concat_ids, fwd_batch.positions, fwd_batch)
-    ends = torch.cumsum(seq_lens, dim=0)
-    last_indices = ends - 1
-    last_logits = torch.stack([logits[last_indices[i]] for i in range(B)], dim=0)
-    next_ids = sample_next_ids(last_logits, do_sample, temperature, top_k, top_p)
-    next_texts = [tokenizer.decode(int(next_ids[i].item()), skip_special_tokens=True) for i in range(B)]
-    print("=" * 12 + " Prefill " + "=" * 12)
-    for i, s in enumerate(prompts):
-        print(f"[{i}] Prompt: {s}")
-        print(f"Next token id: {int(next_ids[i].item())}")
-        print(f"Next token text: {repr(next_texts[i])}")
-    print("=" * 30)
-    return model, tokenizer, [int(x.item()) for x in next_ids], next_texts
 
-def create_decode_test(
-    model_id: str = "Qwen/Qwen2.5-0.5B",
-    prompts: Optional[List[str]] = None,
-    preset: str = "mix",
-    max_new_tokens: int = 64,
-    do_sample: bool = False,
-    temperature: float = 1.0,
-    top_k: int = 0,
-    top_p: float = 1.0,
-    seed: Optional[int] = None,
-):
-    if prompts is None or len(prompts) == 0:
-        prompts = get_builtin_prompts(preset)
     if seed is not None:
         torch.manual_seed(seed)
-    model = build_model_from_hf(model_id, device="auto")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=True)
-    p = next(model.parameters())
-    device = p.device
-    ids_list: List[torch.Tensor] = []
-    lens: List[int] = []
-    for s in prompts:
-        enc = tokenizer(s, return_tensors="pt", add_special_tokens=False)
-        ids = enc["input_ids"].squeeze(0).to(device)
-        ids_list.append(ids)
-        lens.append(int(ids.numel()))
-    
-    B = len(ids_list)
-    L_max = max(lens)
-    L_total = sum(lens)
-    concat_ids = torch.cat(ids_list, dim=0)
-    num_heads = model.config.num_attention_heads
-    num_kv_heads = model.config.num_key_value_heads
-    head_dim = model.config.hidden_size // num_heads
-    kv_dtype = torch.float16 if device.type in ("cuda", "mps") else torch.float32
-    token_to_kv_pool = MHATokenToKVPool(
-        size=L_total + max_new_tokens * B,
-        dtype=kv_dtype,
-        head_num=num_kv_heads,
-        head_dim=head_dim,
-        layer_num=model.config.num_hidden_layers,
-        device=str(device),
+
+    # Initialize Engine
+    print(f"Initializing Engine with model: {model_id}")
+    engine = Engine(model_id=model_id, device="auto")
+
+    # Create sampling parameters
+    sampling = SamplingParams(
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        do_sample=do_sample,
     )
-    req_to_token_pool = ReqToTokenPool(
-        size=B,
-        max_context_len=L_max + max_new_tokens,
-        device=str(device),
-    )
-    out_cache_loc_prefill = token_to_kv_pool.alloc(L_total)
-    mapping = torch.zeros((B, L_max + max_new_tokens), dtype=torch.int32, device=device)
-    offsets = [0]
-    for n in lens:
-        offsets.append(offsets[-1] + n)
-    for i in range(B):
-        s, e = offsets[i], offsets[i + 1]
-        mapping[i, : lens[i]] = out_cache_loc_prefill[s:e]
-    req_indices = torch.arange(B, dtype=torch.long, device=device)
-    req_to_token_pool.write(req_indices, mapping)
-    seq_lens = torch.tensor(lens, dtype=torch.long, device=device)
-    fwd_batch = SimplifiedForwardBatch.create_prefill_batch(
-        input_ids=concat_ids,
-        req_pool_indices=req_indices,
-        seq_lens=seq_lens,
-        out_cache_loc=out_cache_loc_prefill,
-        req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool=token_to_kv_pool,
-    )
-    
-    with torch.no_grad():
-        logits = model(concat_ids, fwd_batch.positions, fwd_batch)
-    ends = torch.cumsum(seq_lens, dim=0)
-    last_indices = ends - 1
-    last_logits = torch.stack([logits[last_indices[i]] for i in range(B)], dim=0)
-    next_ids = sample_next_ids(last_logits, do_sample, temperature, top_k, top_p).to(device)
-    eos_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else -1
-    generated: List[List[int]] = [[] for _ in range(B)]
-    cur_lens = seq_lens.clone()
-    finished = torch.zeros(B, dtype=torch.bool, device=device)
-    for _ in range(max_new_tokens):
-        new_locs = token_to_kv_pool.alloc(B)
-        rows = torch.arange(B, dtype=torch.long, device=device)
-        req_to_token_pool.req_to_token[rows, cur_lens] = new_locs
-        cur_lens = cur_lens + 1
-        dec_input = next_ids.to(device=device, dtype=torch.long)
-        for i in range(B):
-            if not bool(finished[i].item()):
-                generated[i].append(int(dec_input[i].item()))
-        dec_fwd = SimplifiedForwardBatch.create_decode_batch(
-            input_ids=dec_input,
-            req_pool_indices=req_indices,
-            seq_lens=cur_lens,
-            out_cache_loc=new_locs,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool=token_to_kv_pool,
+
+    print("=" * 12 + " Engine Smoke Test " + "=" * 12)
+    print(f"Testing with {len(prompts)} prompts")
+    print(f"Sampling params: max_new_tokens={max_new_tokens}, do_sample={do_sample}")
+    if do_sample:
+        print(
+            f"                temperature={temperature}, top_k={top_k}, top_p={top_p}"
         )
-        dec_positions = dec_fwd.positions
-        with torch.no_grad():
-            dec_logits = model(dec_input, dec_positions, dec_fwd)
-        next_ids = sample_next_ids(dec_logits, do_sample, temperature, top_k, top_p)
-        if eos_id != -1:
-            finished = finished | (next_ids.to(device) == eos_id)
-            next_ids = torch.where(finished, torch.full_like(next_ids, eos_id), next_ids)
-        if bool(finished.all().item()):
-            break
-    completions: List[str] = []
-    for i in range(B):
-        completions.append(tokenizer.decode(generated[i], skip_special_tokens=True))
-    print("=" * 12 + " Decode " + "=" * 12)
-    for i, s in enumerate(prompts):
-        print(f"[{i}] Prompt: {s}")
-        print(f"Completion: {completions[i]!r}")
-    print("=" * 30)
-    return completions
+
+    # Test generation
+    try:
+        outputs = engine.generate(prompts, sampling)
+
+        # Basic smoke test assertions
+        assert isinstance(outputs, list), "Output should be a list"
+        assert len(outputs) == len(
+            prompts
+        ), f"Expected {len(prompts)} outputs, got {len(outputs)}"
+
+        for i, (prompt, output) in enumerate(zip(prompts, outputs)):
+            assert isinstance(output, str), f"Output {i} should be a string"
+            assert len(output) > 0, f"Output {i} should not be empty"
+
+            print(f"[{i}] Prompt: {prompt}")
+            print(f"    Output: {output!r}")
+            print()
+
+        print("✅ Engine smoke test PASSED")
+        return outputs
+
+    except Exception as e:
+        print(f"❌ Engine smoke test FAILED: {e}")
+        raise
+
+    finally:
+        print("=" * 45)
+
+
+def test_engine_single_prompt(
+    model_id: str = "Qwen/qwen2.5-1.5B", seed: Optional[int] = None
+):
+    """Test engine with a single simple prompt"""
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    engine = Engine(model_id=model_id, device="auto")
+    sampling = SamplingParams(max_new_tokens=16, do_sample=False)
+
+    prompt = "Hello, how are you?"
+    outputs = engine.generate([prompt], sampling)
+
+    assert len(outputs) == 1
+    assert isinstance(outputs[0], str)
+    assert len(outputs[0]) > 0
+
+    print("=" * 12 + " Single Prompt Test " + "=" * 12)
+    print(f"Prompt: {prompt}")
+    print(f"Output: {outputs[0]!r}")
+    print("✅ Single prompt test PASSED")
+    print("=" * 45)
+
+    return outputs[0]
+
+
+def test_engine_empty_input():
+    """Test engine with edge cases"""
+    engine = Engine(model_id="Qwen/qwen2.5-1.5B", device="auto")
+    sampling = SamplingParams(max_new_tokens=8, do_sample=False)
+
+    # Test empty prompt list
+    try:
+        outputs = engine.generate([], sampling)
+        assert len(outputs) == 0
+        print("✅ Empty input test PASSED")
+    except Exception as e:
+        print(f"❌ Empty input test FAILED: {e}")
+        raise
+
+
+def run_comprehensive_smoke_test(
+    model_id: str = "Qwen/qwen2.5-1.5B", seed: Optional[int] = None
+):
+    """Run comprehensive smoke tests covering various scenarios"""
+    print("🚀 Starting comprehensive Engine smoke tests...")
+    print()
+
+    # Test 1: Single prompt
+    test_engine_single_prompt(model_id, seed)
+
+    # Test 2: Empty input edge case
+    test_engine_empty_input()
+
+    # Test 3: Multiple prompts with greedy sampling
+    test_engine_basic_generation(
+        model_id=model_id, preset="en", max_new_tokens=24, do_sample=False, seed=seed
+    )
+
+    # Test 4: Mixed language prompts
+    test_engine_basic_generation(
+        model_id=model_id, preset="mix", max_new_tokens=20, do_sample=False, seed=seed
+    )
+
+    # Test 5: Sampling generation (if no seed to ensure reproducibility)
+    if seed is not None:
+        test_engine_basic_generation(
+            model_id=model_id,
+            preset="cn",
+            max_new_tokens=16,
+            do_sample=True,
+            temperature=0.7,
+            top_k=20,
+            top_p=0.9,
+            seed=seed,
+        )
+
+    print("🎉 All smoke tests completed successfully!")
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", type=str, default="prefill", choices=["prefill", "decode"])
-    parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-0.5B")
+    parser = argparse.ArgumentParser(description="Smoke test for Engine.generate()")
+    parser.add_argument("--model-id", type=str, default="Qwen/qwen2.5-1.5B")
     parser.add_argument("--prompt", type=str, action="append", default=None)
-    parser.add_argument("--preset", type=str, default="mix", choices=["mix", "en", "cn", "code", "math", "qa"])
-    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default="mix",
+        choices=["mix", "en", "cn", "code", "math", "qa"],
+    )
+    parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--comprehensive", action="store_true", help="Run comprehensive smoke tests"
+    )
+
     args = parser.parse_args()
-    prompts: Optional[List[str]] = args.prompt if args.prompt else get_builtin_prompts(args.preset)
-    if args.mode == "prefill":
-        create_prefill_test(
-            model_id=args.model_id,
-            prompts=prompts,
-            preset=args.preset,
-            do_sample=args.do_sample,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            seed=args.seed,
-        )
+
+    if args.comprehensive:
+        run_comprehensive_smoke_test(model_id=args.model_id, seed=args.seed)
     else:
-        create_decode_test(
+        prompts = args.prompt if args.prompt else get_builtin_prompts(args.preset)
+        test_engine_basic_generation(
             model_id=args.model_id,
             prompts=prompts,
             preset=args.preset,
@@ -301,6 +245,7 @@ def main():
             top_p=args.top_p,
             seed=args.seed,
         )
+
 
 if __name__ == "__main__":
     main()
