@@ -4,6 +4,7 @@ import os
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
+import logging
 
 from forward_batch import SimplifiedForwardBatch
 from memory_pool import ReqToTokenPool, MHATokenToKVPool
@@ -11,6 +12,34 @@ from sample import SamplingParams
 from sample import sample_next_ids
 from request import Request
 from radix_cache import RadixCache
+
+# Configure unified debug logger (shared with attention)
+_attn_logger = logging.getLogger("baby_sgl.attn")
+if not _attn_logger.handlers:
+    _attn_logger.setLevel(logging.DEBUG)
+    os.makedirs("baby-sgl/debug", exist_ok=True)
+    fh = logging.FileHandler("baby-sgl/debug/attn_debug.log")
+    fh.setLevel(logging.DEBUG)
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    fh.setFormatter(fmt)
+    _attn_logger.addHandler(fh)
+
+
+def _sched_log_tensor_stats(name: str, t: torch.Tensor):
+    try:
+        _attn_logger.debug(
+            f"{name}: shape={tuple(t.shape)} dtype={t.dtype} device={t.device}"
+        )
+        if t.numel() > 0 and t.dtype.is_floating_point:
+            _attn_logger.debug(
+                f"{name}: min={t.min().item():.6f} max={t.max().item():.6f} mean={t.mean().item():.6f}"
+            )
+        elif t.numel() > 0 and t.dtype in (torch.int32, torch.int64):
+            _attn_logger.debug(
+                f"{name}: min={int(t.min().item())} max={int(t.max().item())}"
+            )
+    except Exception as e:
+        _attn_logger.warning(f"_sched_log_tensor_stats error for {name}: {e}")
 
 
 class Scheduler:
@@ -297,6 +326,19 @@ class Scheduler:
             prefix_lens, dtype=torch.long, device=self.device
         )
         total_tokens = concat_input_ids.shape[0]
+        # Debug: prefill batch construction
+        _attn_logger.debug(
+            f"_prepare_prefill_batch: B={B} total_new_tokens={total_tokens} waiting_batch_size={len(batch_requests)}"
+        )
+        _sched_log_tensor_stats("prefill.concat_input_ids", concat_input_ids)
+        _sched_log_tensor_stats("prefill.seq_lens_tensor", seq_lens_tensor)
+        _sched_log_tensor_stats("prefill.prefix_lens_tensor", prefix_lens_tensor)
+        try:
+            _attn_logger.debug(
+                f"prefill.seq_lens={seq_lens} prefix_lens={prefix_lens} new_token_counts={[int(len(req.input_ids) - req.num_cached_tokens) for req in batch_requests]}"
+            )
+        except Exception as e:
+            _attn_logger.warning(f"prefill lens debug error: {e}")
 
         out_cache_loc = self.token_to_kv_pool.alloc(total_tokens)
         if out_cache_loc is None:
@@ -309,9 +351,20 @@ class Scheduler:
                     self.token_to_kv_pool.available_size()
                     + self.tree_cache.evictable_size()
                 )
+                _attn_logger.error(
+                    f"_prepare_prefill_batch OOM: need={total_tokens} available={avail}"
+                )
                 raise RuntimeError(
                     f"Prefill OOM: need {total_tokens}, available {avail}"
                 )
+        _sched_log_tensor_stats(
+            "prefill.out_cache_loc",
+            (
+                out_cache_loc
+                if isinstance(out_cache_loc, torch.Tensor)
+                else torch.tensor(out_cache_loc)
+            ),
+        )
 
         mapping = torch.zeros(
             (B, self.req_to_token_pool.max_context_len),
@@ -323,16 +376,23 @@ class Scheduler:
         for i, seq_len in enumerate(seq_lens):
             req = batch_requests[i]
 
+            # Write cached prefix indices first
             mapping[i, : req.num_cached_tokens] = req.prefix_indices
+            # Then append new token KV locations
+            new_cnt = seq_len - req.num_cached_tokens
             mapping[i, req.num_cached_tokens : seq_len] = out_cache_loc[
-                token_offset : token_offset + seq_len - req.num_cached_tokens
+                token_offset : token_offset + new_cnt
             ]
-            token_offset += seq_len - req.num_cached_tokens
+            _attn_logger.debug(
+                f"_prepare_prefill_batch map[i={i}]: req_pool_idx(pending) prefix_len={req.num_cached_tokens} full_seq_len={seq_len} new_cnt={new_cnt} cache_loc_offset_range=[{token_offset},{token_offset + new_cnt - 1}]"
+            )
+            token_offset += new_cnt
 
             req.req_pool_idx = req_pool_indices[i].item()
             req.seq_len = seq_len
             self.tree_cache.inc_lock_ref(req.last_node)
 
+        _sched_log_tensor_stats("prefill.mapping", mapping)
         self.req_to_token_pool.write(req_pool_indices, mapping)
 
         return SimplifiedForwardBatch.create_prefill_batch(
@@ -403,9 +463,16 @@ class Scheduler:
             ]
             ends = torch.cumsum(torch.tensor(seq_lens, device=logits.device), dim=0)
             last_indices = ends - 1
+            try:
+                _attn_logger.debug(
+                    f"_sample_next_ids(prefill): seq_lens={seq_lens} ends={ends.tolist()} last_indices={last_indices.tolist()}"
+                )
+            except Exception as e:
+                _attn_logger.warning(f"_sample_next_ids(prefill) debug error: {e}")
             logits = torch.stack(
                 [logits[last_indices[i]] for i in range(len(batch_requests))], dim=0
             )
+            _sched_log_tensor_stats("prefill.logits_last", logits)
 
         # 2. sample next token
         next_ids = []
@@ -421,6 +488,7 @@ class Scheduler:
                 repetition_penalty=req.repetition_penalty,
             )
             next_ids.append(next_id.item())
+        _attn_logger.debug(f"_sample_next_ids: mode={mode} next_ids={next_ids}")
         return torch.tensor(next_ids, dtype=torch.long, device=logits.device)
 
     def _process_results(
