@@ -153,14 +153,52 @@ class SimpleAttentionBackend:
             )  # [t_new]
             mask_2d = full_idx >= allowed.unsqueeze(1)  # [t_new, full_len]
             attn_mask = mask_2d.unsqueeze(0).unsqueeze(0)  # [1, 1, t_new, full_len]
-            # log mask row sums: number of masked positions per new token row
+
+            # Enhanced mask debugging
             try:
                 masked_counts = mask_2d.sum(dim=1)  # [t_new]
-                _attn_logger.debug(
-                    f"prefill[i={i}] mask: full_len={full_len} masked_counts={masked_counts.tolist()} allowed_last={allowed[-1].item() if extended_len>0 else None}"
-                )
+                unmasked_counts = full_len - masked_counts  # [t_new]
+
+                # Log detailed mask analysis for first and last token
+                if extended_len > 0:
+                    first_token_mask_info = {
+                        "position": prefix_len,
+                        "allowed_until": allowed[0].item(),
+                        "can_attend_count": unmasked_counts[0].item(),
+                        "masked_count": masked_counts[0].item(),
+                    }
+                    last_token_mask_info = {
+                        "position": prefix_len + extended_len - 1,
+                        "allowed_until": allowed[-1].item(),
+                        "can_attend_count": unmasked_counts[-1].item(),
+                        "masked_count": masked_counts[-1].item(),
+                    }
+
+                    # Log actual attention pattern for first new token
+                    first_token_attention_range = []
+                    for j in range(full_len):
+                        if not mask_2d[0, j]:
+                            first_token_attention_range.append(j)
+
+                    _attn_logger.debug(
+                        f"prefill[i={i}] MASK_DETAILS: full_len={full_len}, "
+                        f"first_token={first_token_mask_info}, "
+                        f"last_token={last_token_mask_info}, "
+                        f"first_token_attends_positions={first_token_attention_range[:10]}{'...' if len(first_token_attention_range) > 10 else ''}"
+                    )
+
+                    # Validate causal property
+                    expected_unmasked = [
+                        prefix_len + k + 1 for k in range(extended_len)
+                    ]
+                    actual_unmasked = unmasked_counts.tolist()
+                    if expected_unmasked != actual_unmasked:
+                        _attn_logger.warning(
+                            f"prefill[i={i}] MASK_VALIDATION: expected_unmasked={expected_unmasked}, actual_unmasked={actual_unmasked}"
+                        )
+
             except Exception as e:
-                _attn_logger.warning(f"prefill[i={i}] mask logging error: {e}")
+                _attn_logger.warning(f"prefill[i={i}] enhanced mask logging error: {e}")
 
             per_req_out = F.scaled_dot_product_attention(
                 q_sdpa,
