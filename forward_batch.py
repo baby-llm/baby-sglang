@@ -17,6 +17,10 @@ class SimplifiedForwardBatch:
     token_to_kv_pool: MHATokenToKVPool
     is_prefill: bool = True
 
+    # Prefix cache metadata
+    prefix_lens: torch.Tensor = None
+    extended_lens: torch.Tensor = None
+
     @classmethod
     def create_prefill_batch(
         cls,
@@ -26,13 +30,18 @@ class SimplifiedForwardBatch:
         out_cache_loc: torch.Tensor,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool: MHATokenToKVPool,
+        prefix_lens: torch.Tensor,
     ):
         batch_size = len(req_pool_indices)
-        total_tokens = input_ids.shape[0]
+        extended_lens = (seq_lens - prefix_lens).to(
+            dtype=torch.long, device=input_ids.device
+        )
 
         positions = []
-        for seq_len in seq_lens:
-            positions.extend(range(seq_len.item()))
+        for i in range(batch_size):
+            pl = int(prefix_lens[i].item())
+            nl = int(extended_lens[i].item())
+            positions.extend(range(pl, pl + nl))
         positions = torch.tensor(positions, device=input_ids.device, dtype=torch.long)
 
         return cls(
@@ -45,6 +54,8 @@ class SimplifiedForwardBatch:
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
             is_prefill=True,
+            prefix_lens=prefix_lens,
+            extended_lens=extended_lens,
         )
 
     @classmethod
