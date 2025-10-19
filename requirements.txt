@@ -1,0 +1,27 @@
+# Core dependencies for baby-sgl project
+torch>=2.0.0
+transformers>=4.35.0
+tokenizers>=0.15.0
+
+# Optional dependencies for specific backends
+# For CUDA support (if available)
+# torch>=2.0.0+cu118  # Use CUDA version if needed
+
+# For MPS support (Apple Silicon)
+# torch>=2.0.0  # MPS support included in PyTorch 2.0+
+
+# Development and testing dependencies
+numpy>=1.21.0
+tqdm>=4.64.0
+
+# For model loading and inference
+accelerate>=0.24.0  # Optional, for distributed loading
+safetensors>=0.4.0  # Optional, for faster model loading
+
+# For testing and debugging
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# For documentation (optional)
+sphinx>=6.0.0
+sphinx-rtd-theme>=1.0.0
