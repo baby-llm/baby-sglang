@@ -10,6 +10,7 @@ from memory_pool import ReqToTokenPool, MHATokenToKVPool
 from sample import SamplingParams
 from sample import sample_next_ids
 from request import Request
+from radix_cache import RadixCache
 
 
 class Scheduler:
@@ -58,6 +59,12 @@ class Scheduler:
 
         self.CLIP_MAX_NEW_TOKENS_ESTIMATION = 512  # max limit
 
+        self.tree_cache = RadixCache(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+        )
+        # self.cache_metrics = {"total_tokens": 0, "hit_tokens": 0}
+
     def run_batch(
         self,
         requests: List[torch.Tensor],
@@ -78,6 +85,9 @@ class Scheduler:
                 do_sample=sampling.do_sample,
                 repetition_penalty=getattr(sampling, "repetition_penalty", 1.0),
                 eos_id=sampling.eos_id,
+                prefix_indices=torch.tensor([], dtype=torch.int32),
+                last_node=None,
+                num_cached_tokens=0,
             )
 
             self.waiting_queue.append(req)
@@ -136,12 +146,23 @@ class Scheduler:
     def _try_select_prefill(self) -> List[Request]:
         """
         1. len(can_run_list) <= req_to_token_pool.availabel_size()
-        2. sum(len(input_ids) + max_new_tokens) in can_run_list <= token_to_kv_pool.available_size() - sum(r * (max_new_tokens - len(output_ids))) in decoding_batch
+        2. sum((len(input_ids) - cached_len) + max_new_tokens) in can_run_list
+           <= token_to_kv_pool.available_size() + tree_cache.evictable_size()
+              - sum(r * (max_new_tokens - len(output_ids))) in decoding_batch
         """
-        self.waiting_queue.sort(key=lambda req: len(req.input_ids))
+        # FIXME(prefix_cache): tree_cache.evictable_size() def add_one_req(self, req: Req) L447 和 L 462
+        for req in self.waiting_queue:
+            req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
+                req.input_ids.tolist()
+            )
+            req.num_cached_tokens = len(req.prefix_indices)
+
+        self.waiting_queue.sort(key=lambda r: len(r.prefix_indices), reverse=True)
 
         num_req_available = self.req_to_token_pool.available_size()
-        num_token_available = self.token_to_kv_pool.available_size()
+        num_token_available = (
+            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
+        )
         r = self.est_new_token_ratio
 
         num_reserved_tokens = 0
@@ -152,68 +173,92 @@ class Scheduler:
             )
         num_rem_tokens = num_token_available - num_reserved_tokens
 
-        can_run_list = []
+        can_run_list: List[Request] = []
         for req in self.waiting_queue:
+            new_tokens_needed = len(req.input_ids) - len(req.prefix_indices)
+            total_tokens_needed = new_tokens_needed + req.max_new_tokens
             if (
                 len(can_run_list) + 1 <= num_req_available
-                and len(req.input_ids) + req.max_new_tokens <= num_rem_tokens
+                and total_tokens_needed <= num_rem_tokens
             ):
                 can_run_list.append(req)
-                num_rem_tokens -= len(req.input_ids) + req.max_new_tokens
+                num_rem_tokens -= total_tokens_needed
             else:
                 break
 
         return can_run_list
 
     def _try_select_decode(self) -> List[Request]:
-        if len(self.decoding_batch) <= self.token_to_kv_pool.available_size():
+        bs = len(self.decoding_batch)
+
+        if bs <= self.token_to_kv_pool.available_size():
             self.est_new_token_ratio = max(
                 self.min_r, self.est_new_token_ratio - self.decay_step
             )
             return self.decoding_batch[:]  # shallow copy
-        else:
-            # retract some reqs from decoding to waiting
-            retracted_reqs = []
-            while (
+
+        self.tree_cache.evict(bs, self.token_to_kv_pool.free)  # try to free mem firstly
+
+        if bs <= self.token_to_kv_pool.available_size():
+            self.est_new_token_ratio = max(
+                self.min_r, self.est_new_token_ratio - self.decay_step
+            )
+            return self.decoding_batch[:]
+
+        # retract some reqs if still oom
+        retracted_reqs = []
+        while (
+            len(self.decoding_batch) * self.retract_decode_steps
+            > self.token_to_kv_pool.available_size()
+        ):
+            if len(self.decoding_batch) == 0:
+                break
+
+            # 1) remove req from decoding_batch
+            req = self.decoding_batch.pop()
+
+            # 2) free only the uncached suffix firstly
+            token_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, req.num_cached_tokens : req.seq_len
+            ]
+            self.token_to_kv_pool.free(token_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
+
+            # free prefix lock
+            if req.last_node is not None:
+                self.tree_cache.dec_lock_ref(req.last_node)
+
+            # 3) reset req
+            req.reset()
+
+            # 4) add req to waiting_queue
+            retracted_reqs.append(req)
+            self.waiting_queue.append(req)
+
+            # 5) try to free shared prefix cache secondly
+            residual = max(
+                0,
                 len(self.decoding_batch) * self.retract_decode_steps
-                > self.token_to_kv_pool.available_size()
-            ):
-                # 1. remove req from decoding_batch
-                req = self.decoding_batch.pop()
-
-                # 2. free mem for retracted request
-                self.token_to_kv_pool.free(
-                    self.req_to_token_pool.req_to_token[req.req_pool_idx, : req.seq_len]
-                )
-                self.req_to_token_pool.free(req.req_pool_idx)
-
-                # 3. reset req
-                req.reset()
-
-                # 4. add req to waiting_queue
-                retracted_reqs.append(req)
-                self.waiting_queue.append(req)
-
-            assert len(self.decoding_batch) > 0
-
-            # 5. update est_new_token_ratio
-            total_decoded_tokens = sum(
-                len(req.output_ids) for req in self.decoding_batch
+                - self.token_to_kv_pool.available_size(),
             )
-            total_max_new_tokens = sum(
-                req.max_new_tokens for req in self.decoding_batch
-            )
-            if total_max_new_tokens > 0:
-                new_est_ratio = (
-                    total_decoded_tokens
-                    + len(self.decoding_batch) * self.retract_decode_steps
-                ) / total_max_new_tokens
-            else:
-                new_est_ratio = self.est_new_token_ratio  # Keep current ratio
+            if residual > 0:
+                self.tree_cache.evict(residual, self.token_to_kv_pool.free)
 
-            self.est_new_token_ratio = min(1.0, new_est_ratio)
+        assert len(self.decoding_batch) > 0
 
-            return self.decoding_batch[:]  # shallow copy
+        # 5) update est_new_token_ratio
+        total_decoded_tokens = sum(len(req.output_ids) for req in self.decoding_batch)
+        total_max_new_tokens = sum(req.max_new_tokens for req in self.decoding_batch)
+        if total_max_new_tokens > 0:
+            new_est_ratio = (
+                total_decoded_tokens
+                + len(self.decoding_batch) * self.retract_decode_steps
+            ) / total_max_new_tokens
+        else:
+            new_est_ratio = self.est_new_token_ratio  # Keep current ratio
+
+        self.est_new_token_ratio = min(1.0, new_est_ratio)
+        return self.decoding_batch[:]  # shallow copy
 
     def _prepare_forward(
         self, batch_requests: List[Request], mode: str
@@ -239,18 +284,34 @@ class Scheduler:
 
         input_ids_list = []
         seq_lens = []
+        prefix_lens = []
 
         for req in batch_requests:
-            input_ids_list.append(req.input_ids)
+            input_ids_list.append(req.input_ids[req.num_cached_tokens :])
             seq_lens.append(len(req.input_ids))
+            prefix_lens.append(req.num_cached_tokens)
 
         concat_input_ids = torch.cat(input_ids_list, dim=0)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.long, device=self.device)
+        prefix_lens_tensor = torch.tensor(
+            prefix_lens, dtype=torch.long, device=self.device
+        )
         total_tokens = concat_input_ids.shape[0]
 
         out_cache_loc = self.token_to_kv_pool.alloc(total_tokens)
         if out_cache_loc is None:
-            raise RuntimeError("Failed to allocate KV cache slots")
+            # need eviction from radix cache
+            # FIXME(prefix_cache): only evict necessary tokens
+            self.tree_cache.evict(total_tokens, self.token_to_kv_pool.free)
+            out_cache_loc = self.token_to_kv_pool.alloc(total_tokens)
+            if out_cache_loc is None:
+                avail = (
+                    self.token_to_kv_pool.available_size()
+                    + self.tree_cache.evictable_size()
+                )
+                raise RuntimeError(
+                    f"Prefill OOM: need {total_tokens}, available {avail}"
+                )
 
         mapping = torch.zeros(
             (B, self.req_to_token_pool.max_context_len),
@@ -260,12 +321,17 @@ class Scheduler:
 
         token_offset = 0
         for i, seq_len in enumerate(seq_lens):
-            mapping[i, :seq_len] = out_cache_loc[token_offset : token_offset + seq_len]
-            token_offset += seq_len
-
             req = batch_requests[i]
+
+            mapping[i, : req.num_cached_tokens] = req.prefix_indices
+            mapping[i, req.num_cached_tokens : seq_len] = out_cache_loc[
+                token_offset : token_offset + seq_len - req.num_cached_tokens
+            ]
+            token_offset += seq_len - req.num_cached_tokens
+
             req.req_pool_idx = req_pool_indices[i].item()
             req.seq_len = seq_len
+            self.tree_cache.inc_lock_ref(req.last_node)
 
         self.req_to_token_pool.write(req_pool_indices, mapping)
 
@@ -276,6 +342,7 @@ class Scheduler:
             out_cache_loc=out_cache_loc,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
+            prefix_lens=prefix_lens_tensor,
         )
 
     def _prepare_decode_batch(
@@ -331,7 +398,9 @@ class Scheduler:
     ) -> torch.Tensor:
         # 1. extract last token for prefill requests
         if mode == "prefill":
-            seq_lens = [len(req.input_ids) for req in batch_requests]
+            seq_lens = [
+                len(req.input_ids) - len(req.prefix_indices) for req in batch_requests
+            ]
             ends = torch.cumsum(torch.tensor(seq_lens, device=logits.device), dim=0)
             last_indices = ends - 1
             logits = torch.stack(
@@ -357,14 +426,12 @@ class Scheduler:
     def _process_results(
         self, next_ids: torch.Tensor, batch_requests: List[Request], mode: str
     ):
-        # 1. append sampled token id
+        # 1) append sampled token id and set finish flags
         for i, req in enumerate(batch_requests):
             next_id = int(next_ids[i].item())
-
             req.output_ids.append(next_id)
 
             finished = False
-
             if len(req.output_ids) >= req.max_new_tokens:
                 finished = True
 
@@ -373,25 +440,28 @@ class Scheduler:
 
             req.finished = finished
 
-            # 2. free the finished requests
-            if finished:
-                self.finished_requests.append(req)
-
-                self.token_to_kv_pool.free(
-                    self.req_to_token_pool.req_to_token[req.req_pool_idx, : req.seq_len]
-                )
-                self.req_to_token_pool.free(req.req_pool_idx)
-                req.req_pool_idx = None
-
-        # 3. update status for requests
+        # 2) handle cache + queues
         if mode == "prefill":
             for req in batch_requests:
-                if not req.finished:
+                if req.finished:
+                    self.tree_cache.cache_finished_req(req)
+                    self.finished_requests.append(req)
+                else:
+                    self.tree_cache.cache_unfinished_req(
+                        req, token_ids=req.input_ids.tolist()
+                    )
                     self.decoding_batch.append(req)
+
+                # remove from waiting queue
                 if req in self.waiting_queue:
                     self.waiting_queue.remove(req)
 
         elif mode == "decode":
+            for req in batch_requests:
+                if req.finished:
+                    self.tree_cache.cache_finished_req(req)
+                    self.finished_requests.append(req)
+
             self.decoding_batch = [
                 req for req in self.decoding_batch if not req.finished
             ]

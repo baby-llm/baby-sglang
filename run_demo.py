@@ -67,6 +67,7 @@ def test_engine_basic_generation(
     top_k: int = 0,
     top_p: float = 1.0,
     seed: Optional[int] = None,
+    device: str = "auto",
 ):
     """
     Smoke test for basic generation functionality.
@@ -80,7 +81,7 @@ def test_engine_basic_generation(
 
     # Initialize Engine
     print(f"Initializing Engine with model: {model_id}")
-    engine = Engine(model_id=model_id, device="auto")
+    engine = Engine(model_id=model_id, device=device)
 
     # Create sampling parameters
     sampling = SamplingParams(
@@ -129,13 +130,15 @@ def test_engine_basic_generation(
 
 
 def test_engine_single_prompt(
-    model_id: str = "Qwen/qwen2.5-1.5B", seed: Optional[int] = None
+    model_id: str = "Qwen/qwen2.5-1.5B",
+    seed: Optional[int] = None,
+    device: str = "auto",
 ):
     """Test engine with a single simple prompt"""
     if seed is not None:
         torch.manual_seed(seed)
 
-    engine = Engine(model_id=model_id, device="auto")
+    engine = Engine(model_id=model_id, device=device)
     sampling = SamplingParams(max_new_tokens=16, do_sample=False)
 
     prompt = "Hello, how are you?"
@@ -154,9 +157,9 @@ def test_engine_single_prompt(
     return outputs[0]
 
 
-def test_engine_empty_input():
+def test_engine_empty_input(device: str = "auto"):
     """Test engine with edge cases"""
-    engine = Engine(model_id="Qwen/qwen2.5-1.5B", device="auto")
+    engine = Engine(model_id="Qwen/qwen2.5-1.5B", device=device)
     sampling = SamplingParams(max_new_tokens=8, do_sample=False)
 
     # Test empty prompt list
@@ -170,26 +173,38 @@ def test_engine_empty_input():
 
 
 def run_comprehensive_smoke_test(
-    model_id: str = "Qwen/qwen2.5-1.5B", seed: Optional[int] = None
+    model_id: str = "Qwen/qwen2.5-1.5B",
+    seed: Optional[int] = None,
+    device: str = "auto",
 ):
     """Run comprehensive smoke tests covering various scenarios"""
     print("🚀 Starting comprehensive Engine smoke tests...")
     print()
 
     # Test 1: Single prompt
-    test_engine_single_prompt(model_id, seed)
+    test_engine_single_prompt(model_id, seed, device)
 
     # Test 2: Empty input edge case
-    test_engine_empty_input()
+    test_engine_empty_input(device=device)
 
     # Test 3: Multiple prompts with greedy sampling
     test_engine_basic_generation(
-        model_id=model_id, preset="en", max_new_tokens=24, do_sample=False, seed=seed
+        model_id=model_id,
+        preset="en",
+        max_new_tokens=24,
+        do_sample=False,
+        seed=seed,
+        device=device,
     )
 
     # Test 4: Mixed language prompts
     test_engine_basic_generation(
-        model_id=model_id, preset="mix", max_new_tokens=20, do_sample=False, seed=seed
+        model_id=model_id,
+        preset="mix",
+        max_new_tokens=20,
+        do_sample=False,
+        seed=seed,
+        device=device,
     )
 
     # Test 5: Sampling generation (if no seed to ensure reproducibility)
@@ -203,6 +218,7 @@ def run_comprehensive_smoke_test(
             top_k=20,
             top_p=0.9,
             seed=seed,
+            device=device,
         )
 
     print("🎉 All smoke tests completed successfully!")
@@ -225,13 +241,18 @@ def main():
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"]
+    )
+    parser.add_argument(
         "--comprehensive", action="store_true", help="Run comprehensive smoke tests"
     )
 
     args = parser.parse_args()
 
     if args.comprehensive:
-        run_comprehensive_smoke_test(model_id=args.model_id, seed=args.seed)
+        run_comprehensive_smoke_test(
+            model_id=args.model_id, seed=args.seed, device=args.device
+        )
     else:
         prompts = args.prompt if args.prompt else get_builtin_prompts(args.preset)
         test_engine_basic_generation(
@@ -244,6 +265,7 @@ def main():
             top_k=args.top_k,
             top_p=args.top_p,
             seed=args.seed,
+            device=args.device,
         )
 
 
