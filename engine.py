@@ -39,12 +39,15 @@ class Engine:
         device = p.device
 
         # 1. Tokenize to device tensors
-        ids_list: List[torch.Tensor] = []
-        for s in requests:
-            # Use special tokens (e.g., BOS) to improve early decoding stability
-            enc = self.tokenizer(s, return_tensors="pt", add_special_tokens=True)
-            ids = enc["input_ids"].squeeze(0).to(device)
-            ids_list.append(ids)
+        enc = self.tokenizer(
+            requests,
+            add_special_tokens=False,
+            return_tensors=None,  # avoid padding; keep variable lengths per request
+        )
+        ids_list: List[torch.Tensor] = [
+            torch.tensor(ids, dtype=torch.long, device=device)
+            for ids in enc["input_ids"]
+        ]
 
         # 2. Run scheduler
         out_token_ids: List[List[int]] = self.scheduler.run_batch(ids_list, sampling)
