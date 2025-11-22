@@ -11,6 +11,8 @@ from sample import SamplingParams
 from sample import sample_next_ids
 from request import Request
 from radix_cache import RadixCache
+from contextlib import contextmanager
+from radix_tree import TreeNode
 
 
 class Scheduler:
@@ -145,12 +147,9 @@ class Scheduler:
 
     def _try_select_prefill(self) -> List[Request]:
         """
-        1. len(can_run_list) <= req_to_token_pool.availabel_size()
-        2. sum((len(input_ids) - cached_len) + max_new_tokens) in can_run_list
-           <= token_to_kv_pool.available_size() + tree_cache.evictable_size()
-              - sum(r * (max_new_tokens - len(output_ids))) in decoding_batch
+        1. required request <= available
+        2. required token <= available - preserved + evictable
         """
-        # FIXME(prefix_cache): tree_cache.evictable_size() def add_one_req(self, req: Req) L447 和 L 462
         for req in self.waiting_queue:
             req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
                 req.input_ids.tolist()
@@ -160,9 +159,7 @@ class Scheduler:
         self.waiting_queue.sort(key=lambda r: len(r.prefix_indices), reverse=True)
 
         num_req_available = self.req_to_token_pool.available_size()
-        num_token_available = (
-            self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
-        )
+        num_token_available = self.token_to_kv_pool.available_size()
         r = self.est_new_token_ratio
 
         num_reserved_tokens = 0
@@ -175,16 +172,19 @@ class Scheduler:
 
         can_run_list: List[Request] = []
         for req in self.waiting_queue:
-            new_tokens_needed = len(req.input_ids) - len(req.prefix_indices)
-            total_tokens_needed = new_tokens_needed + req.max_new_tokens
-            if (
-                len(can_run_list) + 1 <= num_req_available
-                and total_tokens_needed <= num_rem_tokens
-            ):
-                can_run_list.append(req)
-                num_rem_tokens -= total_tokens_needed
-            else:
-                break
+            with self._lock_node(req.last_node):
+                new_tokens_needed = len(req.input_ids) - len(req.prefix_indices)
+                total_tokens_needed = new_tokens_needed + req.max_new_tokens
+                if (
+                    len(can_run_list) + 1 <= num_req_available
+                    and total_tokens_needed
+                    <= num_rem_tokens + self.tree_cache.evictable_size()
+                ):
+                    num_rem_tokens -= total_tokens_needed
+                    self.tree_cache.inc_lock_ref(req.last_node)
+                    can_run_list.append(req)
+                else:
+                    break
 
         return can_run_list
 
@@ -249,13 +249,9 @@ class Scheduler:
         # 5) update est_new_token_ratio
         total_decoded_tokens = sum(len(req.output_ids) for req in self.decoding_batch)
         total_max_new_tokens = sum(req.max_new_tokens for req in self.decoding_batch)
-        if total_max_new_tokens > 0:
-            new_est_ratio = (
-                total_decoded_tokens
-                + len(self.decoding_batch) * self.retract_decode_steps
-            ) / total_max_new_tokens
-        else:
-            new_est_ratio = self.est_new_token_ratio  # Keep current ratio
+        new_est_ratio = (
+            total_decoded_tokens + len(self.decoding_batch) * self.retract_decode_steps
+        ) / total_max_new_tokens
 
         self.est_new_token_ratio = min(1.0, new_est_ratio)
         return self.decoding_batch[:]  # shallow copy
@@ -301,7 +297,6 @@ class Scheduler:
         out_cache_loc = self.token_to_kv_pool.alloc(total_tokens)
         if out_cache_loc is None:
             # need eviction from radix cache
-            # FIXME(prefix_cache): only evict necessary tokens
             self.tree_cache.evict(total_tokens, self.token_to_kv_pool.free)
             out_cache_loc = self.token_to_kv_pool.alloc(total_tokens)
             if out_cache_loc is None:
@@ -331,7 +326,6 @@ class Scheduler:
 
             req.req_pool_idx = req_pool_indices[i].item()
             req.seq_len = seq_len
-            self.tree_cache.inc_lock_ref(req.last_node)
 
         self.req_to_token_pool.write(req_pool_indices, mapping)
 
@@ -398,6 +392,7 @@ class Scheduler:
     ) -> torch.Tensor:
         # 1. extract last token for prefill requests
         if mode == "prefill":
+            # FIXME(@huangyz): edge case: len(input_ids) = len(prefix_lens)
             seq_lens = [
                 len(req.input_ids) - len(req.prefix_indices) for req in batch_requests
             ]
@@ -465,3 +460,11 @@ class Scheduler:
             self.decoding_batch = [
                 req for req in self.decoding_batch if not req.finished
             ]
+
+    @contextmanager
+    def _lock_node(self, last_node: TreeNode):
+        try:
+            self.tree_cache.inc_lock_ref(last_node)
+            yield None
+        finally:
+            self.tree_cache.dec_lock_ref(last_node)
