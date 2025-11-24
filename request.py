@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 import torch
 from radix_tree import TreeNode
+from constraints import ConstraintState
 
 
 @dataclass
@@ -25,6 +26,7 @@ class Request:
     )
     last_node: Optional[TreeNode] = None
     num_cached_tokens: int = 0
+    constraint_state: Optional[ConstraintState] = None
 
     def reset(self):
         self.output_ids = []
@@ -35,3 +37,4 @@ class Request:
         self.prefix_indices = torch.tensor([], dtype=torch.int32)
         self.last_node = None
         self.num_cached_tokens = 0
+        self.constraint_state = None
