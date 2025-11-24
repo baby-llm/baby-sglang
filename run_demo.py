@@ -209,6 +209,8 @@ def run_comprehensive_smoke_test(
     print("🚀 Starting comprehensive Engine smoke tests...")
     print()
 
+    json_schema_for_json = get_builtin_schema("json")
+
     # Test 1: Single prompt
     test_engine_single_prompt(model_id, seed, device, json_schema=json_schema)
 
@@ -237,7 +239,18 @@ def run_comprehensive_smoke_test(
         json_schema=json_schema,
     )
 
-    # Test 5: Sampling generation (if no seed to ensure reproducibility)
+    # Test 5: JSON constrained output
+    test_engine_basic_generation(
+        model_id=model_id,
+        preset="json",
+        max_new_tokens=32,
+        do_sample=False,
+        seed=seed,
+        device=device,
+        json_schema=json_schema_for_json,
+    )
+
+    # Test 6: Sampling generation (if no seed to ensure reproducibility)
     if seed is not None:
         test_engine_basic_generation(
             model_id=model_id,
