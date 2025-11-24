@@ -5,6 +5,8 @@ This test file replicates the logic from test_qwen2.py but uses the high-level E
 """
 
 import argparse
+import json
+import os
 from typing import List, Optional
 import torch
 
@@ -49,12 +51,34 @@ def get_builtin_prompts(preset: str) -> List[str]:
             "Describe the causes and effects of photosynthesis.",
             "What is the difference between RAM and ROM?",
         ]
+    if preset == "json":
+        return [
+            "Return a JSON object for a person with fields name, age, city.",
+            "Produce a JSON record for a book with title and pages.",
+        ]
     return [
         "Hello, introduce yourself briefly.",
         "用中文介绍一下量子计算的基本原理。",
         "Write a Python function to compute Fibonacci numbers efficiently.",
         "给出三条关于上海旅游的建议。",
     ]
+
+
+def get_builtin_schema(preset: str) -> Optional[dict]:
+    if preset == "json":
+        return {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+                "city": {"type": "string"},
+                "title": {"type": "string"},
+                "pages": {"type": "integer"},
+            },
+            "required": [],
+            "additionalProperties": False,
+        }
+    return None
 
 
 def test_engine_basic_generation(
@@ -68,6 +92,7 @@ def test_engine_basic_generation(
     top_p: float = 1.0,
     seed: Optional[int] = None,
     device: str = "auto",
+    json_schema: Optional[dict] = None,
 ):
     """
     Smoke test for basic generation functionality.
@@ -90,6 +115,7 @@ def test_engine_basic_generation(
         top_k=top_k,
         top_p=top_p,
         do_sample=do_sample,
+        json_schema=json_schema,
     )
 
     print("=" * 12 + " Engine Smoke Test " + "=" * 12)
@@ -133,13 +159,14 @@ def test_engine_single_prompt(
     model_id: str = "Qwen/qwen2.5-1.5B",
     seed: Optional[int] = None,
     device: str = "auto",
+    json_schema: Optional[dict] = None,
 ):
     """Test engine with a single simple prompt"""
     if seed is not None:
         torch.manual_seed(seed)
 
     engine = Engine(model_id=model_id, device=device)
-    sampling = SamplingParams(max_new_tokens=16, do_sample=False)
+    sampling = SamplingParams(max_new_tokens=16, do_sample=False, json_schema=json_schema)
 
     prompt = "Hello, how are you?"
     outputs = engine.generate([prompt], sampling)
@@ -176,13 +203,14 @@ def run_comprehensive_smoke_test(
     model_id: str = "Qwen/qwen2.5-1.5B",
     seed: Optional[int] = None,
     device: str = "auto",
+    json_schema: Optional[dict] = None,
 ):
     """Run comprehensive smoke tests covering various scenarios"""
     print("🚀 Starting comprehensive Engine smoke tests...")
     print()
 
     # Test 1: Single prompt
-    test_engine_single_prompt(model_id, seed, device)
+    test_engine_single_prompt(model_id, seed, device, json_schema=json_schema)
 
     # Test 2: Empty input edge case
     test_engine_empty_input(device=device)
@@ -195,6 +223,7 @@ def run_comprehensive_smoke_test(
         do_sample=False,
         seed=seed,
         device=device,
+        json_schema=json_schema,
     )
 
     # Test 4: Mixed language prompts
@@ -205,6 +234,7 @@ def run_comprehensive_smoke_test(
         do_sample=False,
         seed=seed,
         device=device,
+        json_schema=json_schema,
     )
 
     # Test 5: Sampling generation (if no seed to ensure reproducibility)
@@ -219,6 +249,7 @@ def run_comprehensive_smoke_test(
             top_p=0.9,
             seed=seed,
             device=device,
+            json_schema=json_schema,
         )
 
     print("🎉 All smoke tests completed successfully!")
@@ -232,7 +263,7 @@ def main():
         "--preset",
         type=str,
         default="mix",
-        choices=["mix", "en", "cn", "code", "math", "qa"],
+        choices=["mix", "en", "cn", "code", "math", "qa", "json"],
     )
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--do-sample", action="store_true")
@@ -249,9 +280,15 @@ def main():
 
     args = parser.parse_args()
 
+    # Use built-in schema for the json preset
+    json_schema = get_builtin_schema(args.preset)
+
     if args.comprehensive:
         run_comprehensive_smoke_test(
-            model_id=args.model_id, seed=args.seed, device=args.device
+            model_id=args.model_id,
+            seed=args.seed,
+            device=args.device,
+            json_schema=json_schema,
         )
     else:
         prompts = args.prompt if args.prompt else get_builtin_prompts(args.preset)
@@ -266,6 +303,7 @@ def main():
             top_p=args.top_p,
             seed=args.seed,
             device=args.device,
+            json_schema=json_schema,
         )
 
 

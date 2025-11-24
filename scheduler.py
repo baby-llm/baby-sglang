@@ -13,14 +13,14 @@ from request import Request
 from radix_cache import RadixCache
 from contextlib import contextmanager
 from radix_tree import TreeNode
+from transformers.tokenization_utils import PreTrainedTokenizerBase
+from constraints import JsonConstraintState
 
 
 class Scheduler:
-    def __init__(
-        self,
-        model: nn.Module,
-    ) -> None:
+    def __init__(self, model: nn.Module, tokenizer: PreTrainedTokenizerBase) -> None:
         self.model = model
+        self.tokenizer = tokenizer
 
         self.max_total_tokens = token_pool_size = int(
             os.getenv("BABYSGL_MAX_TOTAL_TOKENS", "131072")
@@ -90,6 +90,11 @@ class Scheduler:
                 prefix_indices=torch.tensor([], dtype=torch.int32),
                 last_node=None,
                 num_cached_tokens=0,
+                constraint_state=(
+                    JsonConstraintState(sampling.json_schema, self.tokenizer)
+                    if sampling and getattr(sampling, "json_schema", None)
+                    else None
+                ),
             )
 
             self.waiting_queue.append(req)
@@ -406,6 +411,13 @@ class Scheduler:
         next_ids = []
         for i, req in enumerate(batch_requests):
             token_logits = logits[i : i + 1]  # [1, vocab_size]
+            if req.constraint_state:
+                token_logits = req.constraint_state.process(
+                    req.output_ids, token_logits
+                )
+                if torch.isinf(token_logits).all():
+                    raise RuntimeError("No available token due to constraint decoding")
+
             next_id = sample_next_ids(
                 logits=token_logits,
                 do_sample=req.do_sample,

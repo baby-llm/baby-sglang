@@ -1,3 +1,4 @@
+from typing import Dict
 from dataclasses import dataclass
 import torch
 
@@ -11,6 +12,7 @@ class SamplingParams:
     eos_id: int = -1
     do_sample: bool = False
     repetition_penalty: float = 1.0
+    json_schema: Optional[Dict[str, any]] = None
 
 
 from typing import Optional
