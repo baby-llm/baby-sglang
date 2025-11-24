@@ -19,7 +19,7 @@ class Engine:
             model_id, use_fast=True, trust_remote_code=True
         )
 
-        self.scheduler = Scheduler(self.model)
+        self.scheduler = Scheduler(self.model, self.tokenizer)
 
     def generate(
         self,
