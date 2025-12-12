@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
-"""
-Smoke test for Engine.generate() method.
-This test file replicates the logic from test_qwen2.py but uses the high-level Engine interface.
-"""
 
 import argparse
-import json
-import os
 from typing import List, Optional
 import torch
 
@@ -166,7 +160,9 @@ def test_engine_single_prompt(
         torch.manual_seed(seed)
 
     engine = Engine(model_id=model_id, device=device)
-    sampling = SamplingParams(max_new_tokens=16, do_sample=False, json_schema=json_schema)
+    sampling = SamplingParams(
+        max_new_tokens=16, do_sample=False, json_schema=json_schema
+    )
 
     prompt = "Hello, how are you?"
     outputs = engine.generate([prompt], sampling)
@@ -209,6 +205,8 @@ def run_comprehensive_smoke_test(
     print("🚀 Starting comprehensive Engine smoke tests...")
     print()
 
+    json_schema_for_json = get_builtin_schema("json")
+
     # Test 1: Single prompt
     test_engine_single_prompt(model_id, seed, device, json_schema=json_schema)
 
@@ -237,7 +235,18 @@ def run_comprehensive_smoke_test(
         json_schema=json_schema,
     )
 
-    # Test 5: Sampling generation (if no seed to ensure reproducibility)
+    # Test 5: JSON constrained output
+    test_engine_basic_generation(
+        model_id=model_id,
+        preset="json",
+        max_new_tokens=32,
+        do_sample=False,
+        seed=seed,
+        device=device,
+        json_schema=json_schema_for_json,
+    )
+
+    # Test 6: Sampling generation (if no seed to ensure reproducibility)
     if seed is not None:
         test_engine_basic_generation(
             model_id=model_id,

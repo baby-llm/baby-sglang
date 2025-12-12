@@ -6,9 +6,7 @@ from request import Request
 import heapq
 from radix_tree import TreeNode
 
-"""
-Adapt from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py
-"""
+# Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py
 
 
 def _key_match(key0: List, key1: List):
