@@ -5,7 +5,7 @@ Minimal, hackable LLM inference playground inspired by SGLang. Clarity first, pe
 ## Quick Start
 
 ```bash
-python run_demo.py --comprehensive --model-id Qwen/Qwen2.5-0.5B --max-new-tokens 128 --seed 42 --device auto
+python run_demo.py --model-id Qwen/Qwen2.5-0.5B --preset json --max-new-tokens 1024 --do-sample --temperature 0.7 --top-k 20 --top-p 0.9
 ```
 
 ## Roadmap
