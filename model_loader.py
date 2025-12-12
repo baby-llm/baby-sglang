@@ -1,17 +1,3 @@
-"""
-Model loader for baby-sgl: load HuggingFace Qwen2 weights into simplified BabyQwen2 model.
-
-This module mirrors the verified implementation's loading capability, extracting weights
-from an HF checkpoint and mapping them into our simplified architecture with merged QKV
-and merged MLP Gate/Up projections.
-
-Public APIs:
-- BabyQwenConfig: dataclass that adapts HF config to our simplified model
-- build_model_from_hf(model_id: str, device: str = "auto") -> BabyQwen2ForCausalLM
-- load_weights_from_hf(model: BabyQwen2ForCausalLM, hf_model_path: str, device: str = "auto") -> Tuple[str, torch.dtype]
-- load_weights(model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor]) -> None
-"""
-
 from __future__ import annotations
 
 import logging
@@ -32,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 # ========= Config adapter =========
+
 
 @dataclass
 class BabyQwenConfig:
@@ -56,7 +43,9 @@ class BabyQwenConfig:
         return cls(
             hidden_size=getattr(hf_cfg, "hidden_size"),
             num_attention_heads=getattr(hf_cfg, "num_attention_heads"),
-            num_key_value_heads=getattr(hf_cfg, "num_key_value_heads", getattr(hf_cfg, "num_kv_heads", None)),
+            num_key_value_heads=getattr(
+                hf_cfg, "num_key_value_heads", getattr(hf_cfg, "num_kv_heads", None)
+            ),
             intermediate_size=getattr(hf_cfg, "intermediate_size"),
             num_hidden_layers=getattr(hf_cfg, "num_hidden_layers"),
             vocab_size=getattr(hf_cfg, "vocab_size"),
@@ -71,6 +60,7 @@ class BabyQwenConfig:
 
 # ========= Device / dtype helpers =========
 
+
 def _best_device_str(device: str = "auto") -> Tuple[str, torch.dtype]:
     if device != "auto":
         dt = torch.float16 if device in ("cuda", "mps") else torch.float32
@@ -83,6 +73,7 @@ def _best_device_str(device: str = "auto") -> Tuple[str, torch.dtype]:
 
 
 # ========= HF loader entrypoints =========
+
 
 def build_model_from_hf(model_id: str, device: str = "auto") -> BabyQwen2ForCausalLM:
     """
@@ -139,7 +130,9 @@ def load_weights_from_hf(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        logger.info(f"Successfully loaded Qwen2 weights from {hf_model_path} onto {target_device} with dtype={torch_dtype}")
+        logger.info(
+            f"Successfully loaded Qwen2 weights from {hf_model_path} onto {target_device} with dtype={torch_dtype}"
+        )
         return target_device, torch_dtype
 
     except Exception as e:
@@ -149,7 +142,10 @@ def load_weights_from_hf(
 
 # ========= State dict mapping into simplified structure =========
 
-def load_weights(model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor]) -> None:
+
+def load_weights(
+    model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor]
+) -> None:
     """
     Load weights from a HuggingFace state_dict into the simplified model.
     Supports merged QKV and merged Gate/Up projections.
@@ -169,7 +165,9 @@ def load_weights(model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor
             # Some weights may not exist (e.g., if tied head)
             return
         if p.data.shape != src_tensor.shape:
-            logger.warning(f"Size mismatch for {dst_name}: {tuple(p.data.shape)} vs {tuple(src_tensor.shape)}")
+            logger.warning(
+                f"Size mismatch for {dst_name}: {tuple(p.data.shape)} vs {tuple(src_tensor.shape)}"
+            )
             return
         p.data.copy_(src_tensor.to(p.dtype))
 
@@ -181,7 +179,10 @@ def load_weights(model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor
             copy_param("model.norm.weight", tensor)
         elif name == "lm_head.weight":
             # Copy only if not tied to embeddings
-            if hasattr(model, "lm_head") and (not hasattr(model.model, "embed_tokens") or model.lm_head is not model.model.embed_tokens):
+            if hasattr(model, "lm_head") and (
+                not hasattr(model.model, "embed_tokens")
+                or model.lm_head is not model.model.embed_tokens
+            ):
                 copy_param("lm_head.weight", tensor)
 
     # Per-layer weights: use regex to parse layer index and suffix
@@ -198,7 +199,9 @@ def load_weights(model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor
 
         # Attention QKV merged into: model.layers.{lid}.self_attn.qkv_proj.qkv_proj.{weight,bias}
         if rest == "self_attn.q_proj.weight":
-            p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.weight", None)
+            p = params.get(
+                f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.weight", None
+            )
             if p is not None:
                 p.data[:q_size].copy_(tensor.to(p.dtype))
             continue
@@ -209,25 +212,29 @@ def load_weights(model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor
             continue
 
         if rest == "self_attn.k_proj.weight":
-            p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.weight", None)
+            p = params.get(
+                f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.weight", None
+            )
             if p is not None:
-                p.data[q_size:q_size + kv_size].copy_(tensor.to(p.dtype))
+                p.data[q_size : q_size + kv_size].copy_(tensor.to(p.dtype))
             continue
         if rest == "self_attn.k_proj.bias":
             p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.bias", None)
             if p is not None:
-                p.data[q_size:q_size + kv_size].copy_(tensor.to(p.dtype))
+                p.data[q_size : q_size + kv_size].copy_(tensor.to(p.dtype))
             continue
 
         if rest == "self_attn.v_proj.weight":
-            p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.weight", None)
+            p = params.get(
+                f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.weight", None
+            )
             if p is not None:
-                p.data[q_size + kv_size:].copy_(tensor.to(p.dtype))
+                p.data[q_size + kv_size :].copy_(tensor.to(p.dtype))
             continue
         if rest == "self_attn.v_proj.bias":
             p = params.get(f"model.layers.{lid}.self_attn.qkv_proj.qkv_proj.bias", None)
             if p is not None:
-                p.data[q_size + kv_size:].copy_(tensor.to(p.dtype))
+                p.data[q_size + kv_size :].copy_(tensor.to(p.dtype))
             continue
 
         if rest == "self_attn.o_proj.weight":
@@ -239,23 +246,31 @@ def load_weights(model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor
 
         # MLP merged Gate/Up into: model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.{weight,bias}
         if rest == "mlp.gate_proj.weight":
-            p = params.get(f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.weight", None)
+            p = params.get(
+                f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.weight", None
+            )
             if p is not None:
                 p.data[:inter].copy_(tensor.to(p.dtype))
             continue
         if rest == "mlp.gate_proj.bias":
-            p = params.get(f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.bias", None)
+            p = params.get(
+                f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.bias", None
+            )
             if p is not None:
                 p.data[:inter].copy_(tensor.to(p.dtype))
             continue
 
         if rest == "mlp.up_proj.weight":
-            p = params.get(f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.weight", None)
+            p = params.get(
+                f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.weight", None
+            )
             if p is not None:
                 p.data[inter:].copy_(tensor.to(p.dtype))
             continue
         if rest == "mlp.up_proj.bias":
-            p = params.get(f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.bias", None)
+            p = params.get(
+                f"model.layers.{lid}.mlp.gate_up_proj.gate_up_proj.bias", None
+            )
             if p is not None:
                 p.data[inter:].copy_(tensor.to(p.dtype))
             continue
@@ -278,17 +293,22 @@ def load_weights(model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor
 
 # ========= Optional CLI for quick sanity check =========
 
+
 def _cli():
     import argparse
     from transformers import AutoTokenizer
 
-    parser = argparse.ArgumentParser(description="Build simplified BabyQwen2 model from HF and run a quick prefill.")
+    parser = argparse.ArgumentParser(
+        description="Build simplified BabyQwen2 model from HF and run a quick prefill."
+    )
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--prompt", type=str, default="Hello, how are you?")
     args = parser.parse_args()
 
     model = build_model_from_hf(args.model_id, device="auto")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, use_fast=True, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_id, use_fast=True, trust_remote_code=True
+    )
 
     enc = tokenizer(args.prompt, return_tensors="pt", add_special_tokens=False)
     input_ids = enc["input_ids"].squeeze(0)
@@ -301,7 +321,9 @@ def _cli():
     # Minimal forward (prefill only): the caller should prepare forward_batch externally.
     print("=" * 40)
     print("Model loaded successfully via model_loader.")
-    print(f"Prompt tokens: {input_ids.tolist()[:16]}{'...' if input_ids.numel() > 16 else ''}")
+    print(
+        f"Prompt tokens: {input_ids.tolist()[:16]}{'...' if input_ids.numel() > 16 else ''}"
+    )
     print("=" * 40)
 
 

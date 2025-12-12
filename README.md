@@ -5,7 +5,7 @@ Minimal, hackable LLM inference playground inspired by SGLang. Clarity first, pe
 ## Quick Start
 
 ```bash
-python -m test_qwen2 --mode decode --model-id Qwen/Qwen2.5-0.5B --preset cn --max-new-tokens 64 --do-sample --temperature 0.7 --top-k 40 --top-p 0.9
+python run_demo.py --comprehensive --model-id Qwen/Qwen2.5-0.5B --max-new-tokens 128 --seed 42 --device auto
 ```
 
 ## Roadmap
@@ -13,7 +13,8 @@ python -m test_qwen2 --mode decode --model-id Qwen/Qwen2.5-0.5B --preset cn --ma
 - ✅ Qwen2 support
 - ✅ Paged attention
 - ✅ Dynamic batching
-- 🚧 Radix attention
+- ✅ Radix attention
+- ✅ Constraint decoding
 - 🚧 Asynchronous processing
 - 🚧 Multiple level cache
 - 🚧 TP PP DP support
