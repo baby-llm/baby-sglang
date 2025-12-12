@@ -1,6 +1,7 @@
 from typing import Dict
 from dataclasses import dataclass
 import torch
+from typing import Optional
 
 
 @dataclass

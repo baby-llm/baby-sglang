@@ -30,6 +30,6 @@ class JsonConstraintState(ConstraintState):
         else:
             # We create it here because full_like() also copies the device and dtype
             self.mask = torch.full_like(scores, -math.inf)
-        self.mask[allowed_tokens] = 0
+        self.mask[..., allowed_tokens] = 0
         scores = scores + self.mask
         return scores
