@@ -2,6 +2,7 @@ from typing import Dict
 from dataclasses import dataclass
 import torch
 from typing import Optional
+from typing import Optional
 
 
 @dataclass
@@ -15,18 +16,9 @@ class SamplingParams:
     repetition_penalty: float = 1.0
     json_schema: Optional[Dict[str, any]] = None
 
-
-from typing import Optional
-
-
 def enforce_repetition_penalty_(
     logits: torch.Tensor, prev_ids: Optional[torch.Tensor], penalty: float
 ) -> torch.Tensor:
-    """
-    In-place-ish repetition penalty following common practice:
-      - if logit > 0: logit /= penalty
-      - else:         logit *= penalty
-    """
     if penalty is None or penalty <= 1.0:
         return logits
     if prev_ids is None:
@@ -39,7 +31,6 @@ def enforce_repetition_penalty_(
         return logits
 
     unique_ids = torch.unique(prev_ids)
-    # Apply adjustment token-wise
     for tid in unique_ids.tolist():
         val = logits[..., tid]
         logits[..., tid] = torch.where(val > 0, val / penalty, val * penalty)
