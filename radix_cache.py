@@ -98,10 +98,6 @@ class RadixCache:
         return new_node
 
     def insert(self, key: List[int], value: Optional[torch.Tensor] = None) -> int:
-        # Fallback when value (KV indices) not provided: use token IDs shape as placeholder
-        # Real callers (cache_* methods) pass KV indices tensors.
-        if value is None:
-            value = torch.tensor(key, dtype=torch.int32)
         return self._insert_helper(self.root_node, key, value)
 
     def _insert_helper(self, parent_node: TreeNode, key: List, value):
@@ -144,12 +140,12 @@ class RadixCache:
             return 0  # no match
 
     def cache_finished_req(self, req: Request, token_ids: Optional[List[int]] = None):
-        # Derive token_ids when not provided:
-        # Exclude last generated token as it may not have KV written yet (prefill-finished case).
         if token_ids is None:
             base_ids = req.input_ids.tolist()
             if len(req.output_ids) > 0:
-                token_ids = (base_ids + req.output_ids)[:-1]
+                token_ids = (base_ids + req.output_ids)[
+                    :-1
+                ]  # Exclude last generated token as it may not have KV written yet (prefill-finished case).
             else:
                 token_ids = base_ids
 
@@ -176,11 +172,6 @@ class RadixCache:
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Request, token_ids: Optional[List[int]] = None):
-        # Derive token_ids when not provided:
-        # For unfinished requests, use the full sequence available so far.
-        if token_ids is None:
-            token_ids = req.input_ids.tolist() + req.output_ids
-
         if len(token_ids) == 0:
             return
 

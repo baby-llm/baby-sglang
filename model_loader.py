@@ -10,14 +10,9 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 import torch
 import torch.nn as nn
 
-# Make local imports work without requiring a package
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from qwen2 import BabyQwen2ForCausalLM  # noqa: E402
+from qwen2 import BabyQwen2ForCausalLM
 
 logger = logging.getLogger(__name__)
-
-
-# ========= Config adapter =========
 
 
 @dataclass
@@ -58,9 +53,6 @@ class BabyQwenConfig:
         )
 
 
-# ========= Device / dtype helpers =========
-
-
 def _best_device_str(device: str = "auto") -> Tuple[str, torch.dtype]:
     if device != "auto":
         dt = torch.float16 if device in ("cuda", "mps") else torch.float32
@@ -72,14 +64,7 @@ def _best_device_str(device: str = "auto") -> Tuple[str, torch.dtype]:
     return "cpu", torch.float32
 
 
-# ========= HF loader entrypoints =========
-
-
 def build_model_from_hf(model_id: str, device: str = "auto") -> BabyQwen2ForCausalLM:
-    """
-    Create BabyQwen2ForCausalLM from a HuggingFace model id by adapting the HF config
-    and then copying weights into the simplified architecture.
-    """
     cfg = BabyQwenConfig.from_hf(model_id)
     if cfg.num_key_value_heads is None:
         cfg.num_key_value_heads = cfg.num_attention_heads
@@ -98,11 +83,6 @@ def load_weights_from_hf(
     hf_model_path: str,
     device: str = "auto",
 ) -> Tuple[str, torch.dtype]:
-    """
-    Load weights from a HuggingFace checkpoint into the simplified model.
-    Chooses dtype by device: float16 for CUDA/MPS, float32 for CPU.
-    Avoids requiring `accelerate` by not using `device_map`.
-    """
     try:
         from transformers import AutoModelForCausalLM
 
@@ -140,16 +120,9 @@ def load_weights_from_hf(
         raise
 
 
-# ========= State dict mapping into simplified structure =========
-
-
 def load_weights(
     model: BabyQwen2ForCausalLM, weights: Mapping[str, torch.Tensor]
 ) -> None:
-    """
-    Load weights from a HuggingFace state_dict into the simplified model.
-    Supports merged QKV and merged Gate/Up projections.
-    """
     state = dict(weights) if not isinstance(weights, dict) else weights
     params = dict(model.named_parameters())
 
@@ -289,43 +262,3 @@ def load_weights(
         if rest == "post_attention_layernorm.weight":
             copy_param(f"model.layers.{lid}.post_attention_layernorm.weight", tensor)
             continue
-
-
-# ========= Optional CLI for quick sanity check =========
-
-
-def _cli():
-    import argparse
-    from transformers import AutoTokenizer
-
-    parser = argparse.ArgumentParser(
-        description="Build simplified BabyQwen2 model from HF and run a quick prefill."
-    )
-    parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-0.5B")
-    parser.add_argument("--prompt", type=str, default="Hello, how are you?")
-    args = parser.parse_args()
-
-    model = build_model_from_hf(args.model_id, device="auto")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_id, use_fast=True, trust_remote_code=True
-    )
-
-    enc = tokenizer(args.prompt, return_tensors="pt", add_special_tokens=False)
-    input_ids = enc["input_ids"].squeeze(0)
-
-    # Resolve device/dtype from model
-    p = next(model.parameters())
-    device = p.device
-    input_ids = input_ids.to(device)
-
-    # Minimal forward (prefill only): the caller should prepare forward_batch externally.
-    print("=" * 40)
-    print("Model loaded successfully via model_loader.")
-    print(
-        f"Prompt tokens: {input_ids.tolist()[:16]}{'...' if input_ids.numel() > 16 else ''}"
-    )
-    print("=" * 40)
-
-
-if __name__ == "__main__":
-    _cli()
