@@ -12,6 +12,9 @@ class ConstraintState:
     def process(self, input_ids: List[int], scores: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
+    def reset(self):
+        raise NotImplementedError
+
 
 class JsonConstraintState(ConstraintState):
     def __init__(self, schema: Dict[str, Any], tokenizer) -> None:
@@ -33,3 +36,7 @@ class JsonConstraintState(ConstraintState):
         self.mask[..., allowed_tokens] = 0
         scores = scores + self.mask
         return scores
+
+    def reset(self):
+        self.token_enforcer.prefix_states.clear()
+        self.mask = None

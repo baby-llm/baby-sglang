@@ -37,4 +37,5 @@ class Request:
         self.prefix_indices = torch.tensor([], dtype=torch.int32)
         self.last_node = None
         self.num_cached_tokens = 0
-        self.constraint_state = None
+        if self.constraint_state is not None:
+            self.constraint_state.reset()

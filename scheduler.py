@@ -157,7 +157,9 @@ class Scheduler:
         """
         for req in self.waiting_queue:
             req.prefix_indices, req.last_node = self.tree_cache.match_prefix(
-                req.input_ids.tolist()
+                req.input_ids.tolist()[
+                    :-1
+                ]  # never letting prefix cache cover the full input so that no token to run model forward
             )
             req.num_cached_tokens = len(req.prefix_indices)
 
@@ -397,7 +399,6 @@ class Scheduler:
     ) -> torch.Tensor:
         # 1. extract last token for prefill requests
         if mode == "prefill":
-            # FIXME(@huangyz): edge case: len(input_ids) = len(prefix_lens)
             seq_lens = [
                 len(req.input_ids) - len(req.prefix_indices) for req in batch_requests
             ]
