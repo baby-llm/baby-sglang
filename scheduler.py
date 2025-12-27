@@ -134,6 +134,13 @@ class Scheduler:
 
         return result
 
+    def run_batch_overlap(
+            self,
+            requests: List[torch.Tensor],
+            sampling: Optional[SamplingParams] = None,
+    ) -> List[List[int]]:
+        raise NotImplementedError
+
     def _select_batch_to_run(self) -> Tuple[List[Request], str]:
         # 1. Select prefill first
         if self.waiting_queue:
