@@ -15,6 +15,13 @@ from contextlib import contextmanager
 from radix_tree import TreeNode
 from transformers.tokenization_utils import PreTrainedTokenizerBase
 from constraints import JsonConstraintState
+from overlap_worker import OverlapWorker
+
+
+@dataclass
+class OverlapBatch:
+    batch_requests: List[Request]
+    mode: str
 
 
 class Scheduler:
@@ -66,6 +73,11 @@ class Scheduler:
             token_to_kv_pool=self.token_to_kv_pool,
         )
         # self.cache_metrics = {"total_tokens": 0, "hit_tokens": 0}
+
+        self._overlap_worker = OverlapWorker(
+            model=self.model,
+            max_requests=self.max_requests,
+        )
 
     def run_batch(
         self,
@@ -133,13 +145,6 @@ class Scheduler:
             result.append(req.output_ids)
 
         return result
-
-    def run_batch_overlap(
-            self,
-            requests: List[torch.Tensor],
-            sampling: Optional[SamplingParams] = None,
-    ) -> List[List[int]]:
-        raise NotImplementedError
 
     def _select_batch_to_run(self) -> Tuple[List[Request], str]:
         # 1. Select prefill first
@@ -488,3 +493,84 @@ class Scheduler:
             yield None
         finally:
             self.tree_cache.dec_lock_ref(last_node)
+
+    def run_batch_overlap(
+        self,
+        requests: List[torch.Tensor],
+        sampling: Optional[SamplingParams] = None,
+    ) -> List[List[int]]:
+
+        if sampling is None:
+            sampling = SamplingParams()
+
+        # 1. Enqueue all requests
+        original_order: List[Request] = []
+        for req_input in requests:
+            input_ids = req_input.to(self.device)
+
+            req = Request(
+                input_ids=input_ids,
+                output_ids=[],
+                max_new_tokens=min(sampling.max_new_tokens, self.max_total_tokens),
+                temperature=sampling.temperature,
+                top_k=sampling.top_k,
+                top_p=sampling.top_p,
+                do_sample=sampling.do_sample,
+                repetition_penalty=1.0,  # ignored in overlap mode
+                eos_id=sampling.eos_id,
+                prefix_indices=torch.tensor([], dtype=torch.int32),
+                last_node=None,
+                num_cached_tokens=0,
+                constraint_state=None,  # ignored in overlap mode
+            )
+
+            self.waiting_queue.append(req)
+            original_order.append(req)
+
+        if not original_order:
+            return []
+
+        # 2. Start overlap loop
+        pending: Optional[OverlapBatch] = None  # B1
+
+        while True:
+            # 2.-1 Finish all requests and then exit loop
+            if len(self.finished_requests) == len(original_order):
+                break
+
+            # 2.1 Select next batch
+            batch_requests, mode = self._select_batch_to_run()
+
+            if mode == "error":
+                raise RuntimeError("Insufficient memory to process any requests")
+
+            # 2.2 Prepare forward
+            forward_batch = self._prepare_forward(batch_requests, mode)
+
+            # TODO: 2.3 Move requests between queues / reserve memory / pin locks in advanced for next round selection
+
+            # TODO: 2.4 Explicitly sync between _prepare_forward and forward stream
+
+            # 2.5 Submit the batch
+            future_next_ids = self._overlap_worker.submit(
+                forward_batch=forward_batch,
+                mode=mode,
+                sampling=sampling,
+                # TODO: scheduler_ready
+            )
+
+            # TODO: 2.6 Attach placeholder token to pending_next_id
+
+            submitted: Optional[OverlapBatch] = OverlapBatch(
+                batch_requests=batch_requests, mode=mode
+            )  # B2
+
+            # 2.7 Resolve the pending batch
+            if pending is not None:
+                next_ids = self._overlap_worker.resolve()
+
+                # TODO: 2.8 commit real next_ids and finish / free / cache the pending batch
+
+            pending = submitted
+
+        return [req.output_ids for req in original_order]
