@@ -5,7 +5,7 @@ from radix_tree import TreeNode
 from constraints import ConstraintState
 
 
-@dataclass
+@dataclass(eq=False)
 class Request:
     input_ids: torch.Tensor  # input prompts on the device
     output_ids: List[int]  # output ids
@@ -28,11 +28,16 @@ class Request:
     num_cached_tokens: int = 0
     constraint_state: Optional[ConstraintState] = None
 
+    overlap_next_input_id: Optional[int] = None
+    is_retracted: bool = False
+
     def reset(self):
         self.output_ids = []
         self.req_pool_idx = None
         self.seq_len = 0
         self.finished = False
+        self.overlap_next_input_id = None
+        self.is_retracted = True
 
         self.prefix_indices = torch.tensor([], dtype=torch.int32)
         self.last_node = None

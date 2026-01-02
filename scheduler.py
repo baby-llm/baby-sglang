@@ -22,6 +22,7 @@ from overlap_worker import OverlapWorker
 class OverlapBatch:
     batch_requests: List[Request]
     mode: str
+    forward_batch: SimplifiedForwardBatch
 
 
 class Scheduler:
@@ -374,13 +375,20 @@ class Scheduler:
         for i, req in enumerate(batch_requests):
             if req.req_pool_idx is None:
                 raise RuntimeError(f"Request {i} missing req_pool_idx for decode")
+            if req.is_retracted:
+                raise RuntimeError(
+                    f"Request {i} was retracted but is scheduled for decode"
+                )  # assert
 
             req_pool_indices.append(req.req_pool_idx)
 
             # For decode, we need the last generated token as input
-            if not req.output_ids:
-                raise RuntimeError(f"Request {i} has no output tokens for decode")
-            input_ids.append(req.output_ids[-1])
+            if req.overlap_next_input_id is not None:
+                input_ids.append(req.overlap_next_input_id)
+            else:
+                if not req.output_ids:
+                    raise RuntimeError(f"Request {i} has no output tokens for decode")
+                input_ids.append(req.output_ids[-1])
 
             current_pos = req.seq_len  # logical position for the new token
             self.req_to_token_pool.req_to_token[req.req_pool_idx, current_pos] = (
@@ -531,46 +539,118 @@ class Scheduler:
             return []
 
         # 2. Start overlap loop
-        pending: Optional[OverlapBatch] = None  # B1
+        pending, submitted = None, None
 
         while True:
             # 2.-1 Finish all requests and then exit loop
-            if len(self.finished_requests) == len(original_order):
+            if len(self.finished_requests) == len(original_order) and pending is None:
                 break
 
             # 2.1 Select next batch
             batch_requests, mode = self._select_batch_to_run()
 
-            if mode == "error":
+            if mode == "error" and pending is None:
                 raise RuntimeError("Insufficient memory to process any requests")
 
-            # 2.2 Prepare forward
-            forward_batch = self._prepare_forward(batch_requests, mode)
+            if batch_requests:
+                # 2.2 Prepare forward
+                forward_batch = self._prepare_forward(batch_requests, mode)
 
-            # TODO: 2.3 Move requests between queues / reserve memory / pin locks in advanced for next round selection
+                # 2.3 Submit the batch
+                future_next_ids = self._overlap_worker.submit(
+                    forward_batch=forward_batch,
+                    mode=mode,
+                    sampling=sampling,
+                )
 
-            # TODO: 2.4 Explicitly sync between _prepare_forward and forward stream
+                # 2.4 Append overlap_next_input_id for next round request selection
+                for i, req in enumerate(batch_requests):
+                    req.overlap_next_input_id = int(future_next_ids[i].item())
 
-            # 2.5 Submit the batch
-            future_next_ids = self._overlap_worker.submit(
-                forward_batch=forward_batch,
-                mode=mode,
-                sampling=sampling,
-                # TODO: scheduler_ready
-            )
+                # 2.5 Finish state transition like no overlap
+                if mode == "prefill":
+                    for req in batch_requests:
+                        if req in self.waiting_queue:
+                            self.waiting_queue.remove(req)
+                        if req not in self.decoding_batch:
+                            self.decoding_batch.append(req)
 
-            # TODO: 2.6 Attach placeholder token to pending_next_id
+                submitted = OverlapBatch(
+                    batch_requests=batch_requests,
+                    mode=mode,
+                    forward_batch=forward_batch,
+                )
 
-            submitted: Optional[OverlapBatch] = OverlapBatch(
-                batch_requests=batch_requests, mode=mode
-            )  # B2
-
-            # 2.7 Resolve the pending batch
             if pending is not None:
-                next_ids = self._overlap_worker.resolve()
+                # 2.6 Fetch the delayed result
+                next_ids_cpu = self._overlap_worker.resolve()
 
-                # TODO: 2.8 commit real next_ids and finish / free / cache the pending batch
+                # 2.7 Commit real next_ids and finish / free / cache the pending batch
+                self._process_results_overlap(pending, next_ids_cpu)
 
-            pending = submitted
+            pending, submitted = submitted, None
 
         return [req.output_ids for req in original_order]
+
+    def _process_results_overlap(
+        self, batch: OverlapBatch, next_ids_cpu: torch.Tensor
+    ) -> None:
+        if batch.mode == "prefill":
+            # 1) Append sampled token id and set finished flag
+            for i, req in enumerate(batch.batch_requests):
+                if req.is_retracted:
+                    continue
+                next_id = int(next_ids_cpu[i].item())
+                req.output_ids.append(next_id)
+                req.finished = len(req.output_ids) >= req.max_new_tokens or (
+                    req.eos_id != -1 and next_id == req.eos_id
+                )
+
+            # 2) Handle cache + queues like _process_results
+            for req in batch.batch_requests:
+                if req.is_retracted:
+                    continue
+
+                if req.finished:
+                    self.tree_cache.cache_finished_req(req)
+                    self.finished_requests.append(req)
+                    if req in self.decoding_batch:
+                        self.decoding_batch.remove(req)
+                else:
+                    # Cache only prompt tokens; the newly generated token has no KV yet
+                    self.tree_cache.cache_unfinished_req(
+                        req, token_ids=req.input_ids.tolist()
+                    )
+                    if req not in self.decoding_batch:
+                        self.decoding_batch.append(req)
+
+                if req in self.waiting_queue:
+                    self.waiting_queue.remove(req)
+
+        elif batch.mode == "decode":
+            for i, req in enumerate(batch.batch_requests):
+                if req.is_retracted:
+                    continue
+
+                if req.finished:
+                    # Overlap-specific logic: free KV slot for the extra decode step of an already finished request
+                    # ex. B1: 机 器 学 习 EOS, B2: 机 器 学 习 EOS 小
+                    self.token_to_kv_pool.free(
+                        batch.forward_batch.out_cache_loc[i : i + 1]
+                    )
+                    continue
+
+                next_id = int(next_ids_cpu[i].item())
+                req.output_ids.append(next_id)
+                req.finished = len(req.output_ids) >= req.max_new_tokens or (
+                    req.eos_id != -1 and next_id == req.eos_id
+                )
+
+                if req.finished:
+                    self.tree_cache.cache_finished_req(req)
+                    self.finished_requests.append(req)
+
+            self.decoding_batch = [r for r in self.decoding_batch if not r.finished]
+
+        else:
+            raise ValueError(f"Unknown mode in overlap commit: {batch.mode}")
