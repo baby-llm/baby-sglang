@@ -121,7 +121,7 @@ class OverlapWorker:
             # 4. Extract last logit for sampling
             if work.mode == "prefill":
                 seq_lens = work.forward_batch.extended_lens.to(torch.long)
-                ends = torch.cumsum(torch.tensor(seq_lens, device=logits.device), dim=0)
+                ends = torch.cumsum(seq_lens, dim=0)
                 last_indices = ends - 1
                 logits = logits[last_indices]
             # 5. Sample
