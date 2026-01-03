@@ -25,6 +25,7 @@ class Engine:
         self,
         requests: List[str],
         sampling: Optional[SamplingParams] = None,
+        enable_overlap: Optional[bool] = False,
     ) -> List[str]:
         if sampling is None:
             sampling = SamplingParams()
@@ -50,7 +51,14 @@ class Engine:
         ]
 
         # 2. Run scheduler
-        out_token_ids: List[List[int]] = self.scheduler.run_batch(ids_list, sampling)
+        if enable_overlap:
+            out_token_ids: List[List[int]] = self.scheduler.run_batch_overlap(
+                ids_list, sampling
+            )
+        else:
+            out_token_ids: List[List[int]] = self.scheduler.run_batch(
+                ids_list, sampling
+            )
 
         # 3. Detokenize
         outputs: List[str] = []

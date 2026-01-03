@@ -75,16 +75,18 @@ class Scheduler:
         )
         # self.cache_metrics = {"total_tokens": 0, "hit_tokens": 0}
 
-        self._overlap_worker = OverlapWorker(
-            model=self.model,
-            max_requests=self.max_requests,
-        )
+        self._overlap_worker: Optional[OverlapWorker] = None
 
     def run_batch(
         self,
         requests: List[torch.Tensor],
         sampling: Optional[SamplingParams] = None,
     ) -> List[List[int]]:
+        self.waiting_queue.clear()
+        self.decoding_batch.clear()
+        self.finished_requests.clear()
+        self.est_new_token_ratio = self.r_init
+
         # Step1 Enqueue all requests
         original_order = []
         for i, req_input in enumerate(requests):
@@ -448,7 +450,9 @@ class Scheduler:
                 prev_ids=req.output_ids,
                 repetition_penalty=req.repetition_penalty,
             )
-            next_ids.append(next_id.item())
+            next_ids.append(
+                next_id.item()
+            )  # FIXME: keep next_ids as a GPU tensor to remove unnecessary copies
         return torch.tensor(next_ids, dtype=torch.long, device=logits.device)
 
     def _process_results(
@@ -507,6 +511,17 @@ class Scheduler:
         requests: List[torch.Tensor],
         sampling: Optional[SamplingParams] = None,
     ) -> List[List[int]]:
+
+        self.waiting_queue.clear()
+        self.decoding_batch.clear()
+        self.finished_requests.clear()
+        self.est_new_token_ratio = self.r_init
+
+        if self._overlap_worker is None:
+            self._overlap_worker = OverlapWorker(
+                model=self.model,
+                max_requests=self.max_requests,
+            )
 
         if sampling is None:
             sampling = SamplingParams()

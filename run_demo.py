@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import time
 from typing import List, Optional
 import torch
 
@@ -87,6 +88,7 @@ def test_engine_basic_generation(
     seed: Optional[int] = None,
     device: str = "auto",
     json_schema: Optional[dict] = None,
+    enable_overlap: bool = False,
 ):
     """
     Smoke test for basic generation functionality.
@@ -122,7 +124,18 @@ def test_engine_basic_generation(
 
     # Test generation
     try:
-        outputs = engine.generate(prompts, sampling)
+        print(f"[benchmark] preset={preset} enable_overlap={enable_overlap} start")
+        t0 = time.perf_counter()
+        outputs = engine.generate(prompts, sampling, enable_overlap=enable_overlap)
+        duration = time.perf_counter() - t0
+
+        out_enc = engine.tokenizer(
+            outputs, add_special_tokens=False, return_tensors=None
+        )
+        gen_tokens = sum(len(ids) for ids in out_enc["input_ids"])
+        print(
+            f"[benchmark] preset={preset} enable_overlap={enable_overlap} time={duration:.3f}s gen_tokens={gen_tokens}"
+        )
 
         # Basic smoke test assertions
         assert isinstance(outputs, list), "Output should be a list"
@@ -154,6 +167,7 @@ def test_engine_single_prompt(
     seed: Optional[int] = None,
     device: str = "auto",
     json_schema: Optional[dict] = None,
+    enable_overlap: bool = False,
 ):
     """Test engine with a single simple prompt"""
     if seed is not None:
@@ -165,7 +179,7 @@ def test_engine_single_prompt(
     )
 
     prompt = "Hello, how are you?"
-    outputs = engine.generate([prompt], sampling)
+    outputs = engine.generate([prompt], sampling, enable_overlap=enable_overlap)
 
     assert len(outputs) == 1
     assert isinstance(outputs[0], str)
@@ -180,14 +194,14 @@ def test_engine_single_prompt(
     return outputs[0]
 
 
-def test_engine_empty_input(device: str = "auto"):
+def test_engine_empty_input(device: str = "auto", enable_overlap: bool = False):
     """Test engine with edge cases"""
     engine = Engine(model_id="Qwen/qwen2.5-1.5B", device=device)
     sampling = SamplingParams(max_new_tokens=8, do_sample=False)
 
     # Test empty prompt list
     try:
-        outputs = engine.generate([], sampling)
+        outputs = engine.generate([], sampling, enable_overlap=enable_overlap)
         assert len(outputs) == 0
         print("✅ Empty input test PASSED")
     except Exception as e:
@@ -200,6 +214,7 @@ def run_comprehensive_smoke_test(
     seed: Optional[int] = None,
     device: str = "auto",
     json_schema: Optional[dict] = None,
+    enable_overlap: bool = False,
 ):
     """Run comprehensive smoke tests covering various scenarios"""
     print("🚀 Starting comprehensive Engine smoke tests...")
@@ -208,10 +223,16 @@ def run_comprehensive_smoke_test(
     json_schema_for_json = get_builtin_schema("json")
 
     # Test 1: Single prompt
-    test_engine_single_prompt(model_id, seed, device, json_schema=json_schema)
+    test_engine_single_prompt(
+        model_id,
+        seed,
+        device,
+        json_schema=json_schema,
+        enable_overlap=enable_overlap,
+    )
 
     # Test 2: Empty input edge case
-    test_engine_empty_input(device=device)
+    test_engine_empty_input(device=device, enable_overlap=enable_overlap)
 
     # Test 3: Multiple prompts with greedy sampling
     test_engine_basic_generation(
@@ -222,6 +243,7 @@ def run_comprehensive_smoke_test(
         seed=seed,
         device=device,
         json_schema=json_schema,
+        enable_overlap=enable_overlap,
     )
 
     # Test 4: Mixed language prompts
@@ -233,6 +255,7 @@ def run_comprehensive_smoke_test(
         seed=seed,
         device=device,
         json_schema=json_schema,
+        enable_overlap=enable_overlap,
     )
 
     # Test 5: JSON constrained output
@@ -244,6 +267,7 @@ def run_comprehensive_smoke_test(
         seed=seed,
         device=device,
         json_schema=json_schema_for_json,
+        enable_overlap=enable_overlap,
     )
 
     # Test 6: Sampling generation (if no seed to ensure reproducibility)
@@ -259,6 +283,7 @@ def run_comprehensive_smoke_test(
             seed=seed,
             device=device,
             json_schema=json_schema,
+            enable_overlap=enable_overlap,
         )
 
     print("🎉 All smoke tests completed successfully!")
@@ -284,6 +309,11 @@ def main():
         "--device", type=str, default="auto", choices=["auto", "cuda", "mps", "cpu"]
     )
     parser.add_argument(
+        "--enable-overlap",
+        action="store_true",
+        help="Enable run_batch_overlap (CUDA only)",
+    )
+    parser.add_argument(
         "--comprehensive", action="store_true", help="Run comprehensive smoke tests"
     )
 
@@ -298,6 +328,7 @@ def main():
             seed=args.seed,
             device=args.device,
             json_schema=json_schema,
+            enable_overlap=args.enable_overlap,
         )
     else:
         prompts = args.prompt if args.prompt else get_builtin_prompts(args.preset)
@@ -313,6 +344,7 @@ def main():
             seed=args.seed,
             device=args.device,
             json_schema=json_schema,
+            enable_overlap=args.enable_overlap,
         )
 
 
