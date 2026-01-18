@@ -43,6 +43,9 @@ def main() -> None:
         eos_id=-1,  # disable EOS
     )
 
+    engine.scheduler.run_batch_overlap([prompt_token_ids[-1]], sampling)
+    engine.reset()
+
     torch.cuda.synchronize(device)
     t0 = time.perf_counter()
     out = engine.scheduler.run_batch_overlap(prompt_token_ids, sampling)

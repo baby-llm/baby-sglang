@@ -55,6 +55,13 @@ class OverlapWorker:
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()  # Todo: disable it when normal mode
 
+    def reset(self) -> None:
+        if self.forward_stream is not None:
+            self.forward_stream.synchronize()
+
+        self.future_token_ids_ct = 0
+        self.future_token_ids_map.zero_()
+
     def submit(
         self,
         forward_batch: SimplifiedForwardBatch,

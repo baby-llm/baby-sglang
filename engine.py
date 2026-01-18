@@ -21,6 +21,9 @@ class Engine:
 
         self.scheduler = Scheduler(self.model, self.tokenizer)
 
+    def reset(self) -> None:
+        self.scheduler.reset()
+
     def generate(
         self,
         requests: List[str],

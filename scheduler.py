@@ -77,6 +77,25 @@ class Scheduler:
 
         self._overlap_worker: Optional[OverlapWorker] = None
 
+    def reset(self) -> None:
+        self.req_to_token_pool.clear()
+        self.token_to_kv_pool.clear()
+
+        self.waiting_queue: List[Request] = []
+        self.decoding_batch: List[Request] = []
+        self.finished_requests: List[Request] = []
+
+        self.r_init = 0.5
+        self.min_r = 0.1
+        self.decay_step = (self.r_init - self.min_r) / 50
+        self.est_new_token_ratio = self.r_init
+        self.retract_decode_steps = 20
+
+        self.tree_cache.reset()
+
+        if self._overlap_worker is not None:
+            self._overlap_worker.reset()
+
     def run_batch(
         self,
         requests: List[torch.Tensor],
