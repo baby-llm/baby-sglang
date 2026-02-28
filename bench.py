@@ -22,7 +22,7 @@ def main() -> None:
     engine = Engine(model_id=model_id, device="cuda")
     device = engine.scheduler.device
     vocab_size = int(engine.model.config.vocab_size)
-    gen = torch.Generator(device="cpu").manual_seed(seed)
+    gen = torch.Generator(device=device).manual_seed(seed)
 
     prompt_token_ids = [
         torch.randint(

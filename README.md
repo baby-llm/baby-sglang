@@ -26,8 +26,9 @@ python run_demo.py --model-id Qwen/Qwen2.5-0.5B --preset mix --max-new-tokens 10
 - ✅ Radix attention
 - ✅ Constraint decoding
 - ✅ Overlap schedule
-- 🚀 Benchmark & Observability
-- 🚧 TP PP DP support
+- 🚀 Benchmark
+- 🚧 TP support
+- 🚧 Observability & Profile
 - 🚧 Speculative decoding
 - 🚧 Kernel-level Optimization
 - 🤔 Multiple level cache
