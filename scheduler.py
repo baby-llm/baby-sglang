@@ -168,6 +168,77 @@ class Scheduler:
 
         return result
 
+    def run_batch_static(
+        self,
+        requests: List[torch.Tensor],
+        sampling: Optional[SamplingParams] = None,
+    ) -> List[List[int]]:
+        if sampling is None:
+            sampling = SamplingParams()
+
+        outputs: List[List[int]] = []
+        chunk_size = self.max_requests
+
+        # forward requests chunk by chunk
+        for chunk_start in range(0, len(requests), chunk_size):
+            chunk_requests = requests[chunk_start : chunk_start + chunk_size]
+
+            self.waiting_queue.clear()
+            self.decoding_batch.clear()
+            self.finished_requests.clear()
+            self.est_new_token_ratio = self.r_init
+
+            original_order = []
+            for req_input in chunk_requests:
+                input_ids = req_input.to(self.device)
+
+                req = Request(
+                    input_ids=input_ids,
+                    output_ids=[],
+                    max_new_tokens=min(sampling.max_new_tokens, self.max_total_tokens),
+                    temperature=sampling.temperature,
+                    top_k=sampling.top_k,
+                    top_p=sampling.top_p,
+                    do_sample=sampling.do_sample,
+                    repetition_penalty=getattr(sampling, "repetition_penalty", 1.0),
+                    eos_id=sampling.eos_id,
+                    prefix_indices=torch.tensor([], dtype=torch.int32),
+                    last_node=None,
+                    num_cached_tokens=0,
+                    constraint_state=(
+                        JsonConstraintState(sampling.json_schema, self.tokenizer)
+                        if getattr(sampling, "json_schema", None)
+                        else None
+                    ),
+                )
+
+                self.waiting_queue.append(req)
+                original_order.append(req)
+
+            while True:
+                if len(self.finished_requests) == len(original_order):
+                    break
+
+                running_batch, mode = self._select_batch_to_run()
+
+                if mode == "error":
+                    raise RuntimeError("Insufficient memory to process any requests")
+
+                forward_batch = self._prepare_forward(running_batch, mode)
+
+                with torch.no_grad():
+                    logits = self.model(
+                        forward_batch.input_ids, forward_batch.positions, forward_batch
+                    )
+
+                next_ids = self._sample_next_ids(logits, running_batch, mode)
+                self._process_results(next_ids, running_batch, mode)
+
+            for req in original_order:
+                outputs.append(req.output_ids)
+
+        return outputs
+
     def _select_batch_to_run(self) -> Tuple[List[Request], str]:
         # 1. Select prefill first
         if self.waiting_queue:
