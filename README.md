@@ -1,8 +1,6 @@
-# baby-sgl
+# Baby-SGL
 
-A lightweight sglang implementation built from scratch step-by-step.
-
-Clarity first, performance second.
+A lightweight sglang implementation built from scratch step-by-step with only ~2,000 lines of code.
 
 ## Inspiration
 
